@@ -4,6 +4,25 @@ const path = require('node:path');
 const DEFAULT_BACKEND_URL = 'https://season-fetch.vercel.app';
 const VALID_CHANNELS = new Set(['stable', 'preview']);
 const VALID_THEMES = new Set(['dark']);
+const VALID_RANKING_PREFERENCES = new Set([
+  'best-overall',
+  'smallest-acceptable',
+  'most-reliable',
+  'prefer-1337x',
+  'balanced',
+  'highest-quality'
+]);
+const VALID_AUDIO_PREFERENCES = new Set([
+  'any',
+  'english-dubbed-only',
+  'english-dubbed-or-dual'
+]);
+const VALID_RESOLUTION_PREFERENCES = new Set([
+  '1080p',
+  '720p',
+  '2160p',
+  'any'
+]);
 const DEFAULT_BOUNDS = Object.freeze({
   width: 1240,
   height: 820,
@@ -18,6 +37,9 @@ const DEFAULT_SETTINGS = Object.freeze({
   autoDownloadUpdates: true,
   theme: 'dark',
   backendUrl: DEFAULT_BACKEND_URL,
+  rankingPreference: 'smallest-acceptable',
+  audioPreference: 'any',
+  resolutionPreference: '1080p',
   windowBounds: { ...DEFAULT_BOUNDS }
 });
 
@@ -83,6 +105,15 @@ function sanitizeSettings(raw, options = {}) {
       ? input.theme
       : DEFAULT_SETTINGS.theme,
     backendUrl: validateBackendUrl(input.backendUrl, { allowLocalhost }),
+    rankingPreference: VALID_RANKING_PREFERENCES.has(input.rankingPreference)
+      ? input.rankingPreference
+      : DEFAULT_SETTINGS.rankingPreference,
+    audioPreference: VALID_AUDIO_PREFERENCES.has(input.audioPreference)
+      ? input.audioPreference
+      : DEFAULT_SETTINGS.audioPreference,
+    resolutionPreference: VALID_RESOLUTION_PREFERENCES.has(input.resolutionPreference)
+      ? input.resolutionPreference
+      : DEFAULT_SETTINGS.resolutionPreference,
     windowBounds: sanitizeWindowBounds(input.windowBounds)
   };
 }

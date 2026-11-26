@@ -4,6 +4,12 @@ contextBridge.exposeInMainWorld('seasonfetchDesktop', Object.freeze({
   getAppInfo: () => ipcRenderer.invoke('desktop:get-app-info'),
   apiRequest: request => ipcRenderer.invoke('desktop:api-request', request),
   openExternal: url => ipcRenderer.invoke('desktop:open-external', url),
+  authStorage: Object.freeze({
+    getItem: key => ipcRenderer.invoke('desktop:auth-storage-get', key),
+    setItem: (key, value) => ipcRenderer.invoke('desktop:auth-storage-set', { key, value }),
+    removeItem: key => ipcRenderer.invoke('desktop:auth-storage-remove', key),
+    isSecure: () => ipcRenderer.invoke('desktop:auth-storage-status')
+  }),
   settings: Object.freeze({
     get: () => ipcRenderer.invoke('desktop:settings-get'),
     update: patch => ipcRenderer.invoke('desktop:settings-update', patch)

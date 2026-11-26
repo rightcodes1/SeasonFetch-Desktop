@@ -1,7 +1,8 @@
 const path = require('node:path');
-const { app, BrowserWindow, ipcMain, net, shell, session } = require('electron');
+const { app, BrowserWindow, ipcMain, net, safeStorage, shell, session } = require('electron');
 const { autoUpdater } = require('electron-updater');
 const { createSettingsStore } = require('./services/settingsStore.cjs');
+const { createAuthVault } = require('./services/authStore.cjs');
 const { executeApiRequest } = require('./ipc/apiBridge.cjs');
 const { openExternalTarget } = require('./ipc/protocolHandler.cjs');
 const { createUpdaterController } = require('./services/updaterService.cjs');
@@ -19,6 +20,7 @@ if (!isSmokeTest) {
 
 let mainWindow = null;
 let settingsStore = null;
+let authVault = null;
 let updaterController = null;
 let boundsSaveTimer = null;
 
@@ -37,7 +39,7 @@ function buildContentSecurityPolicy() {
     "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
     "font-src 'self' https://fonts.gstatic.com data:",
     "img-src 'self' https: data:",
-    `connect-src 'self'${devConnect}`,
+    `connect-src 'self' https://*.supabase.co${devConnect}`,
     "object-src 'none'",
     "base-uri 'self'",
     "frame-ancestors 'none'"
@@ -144,7 +146,8 @@ function registerIpcHandlers() {
       nodeVersion: process.versions.node,
       isPackaged: app.isPackaged,
       backendUrl: settings.backendUrl,
-      updateChannel: settings.updateChannel
+      updateChannel: settings.updateChannel,
+      authVaultEncrypted: authVault ? authVault.isPersistentEncryptionAvailable() : false
     };
   });
 
@@ -158,6 +161,25 @@ function registerIpcHandlers() {
 
   ipcMain.handle('desktop:open-external', async (_event, rawUrl) => {
     return openExternalTarget(rawUrl, target => shell.openExternal(target));
+  });
+
+  ipcMain.handle('desktop:auth-storage-get', (_event, key) => {
+    return authVault ? authVault.getItem(key) : null;
+  });
+
+  ipcMain.handle('desktop:auth-storage-set', (_event, payload) => {
+    if (!authVault || !payload || typeof payload !== 'object') return { ok: false };
+    return authVault.setItem(payload.key, payload.value);
+  });
+
+  ipcMain.handle('desktop:auth-storage-remove', (_event, key) => {
+    return authVault ? authVault.removeItem(key) : { ok: false };
+  });
+
+  ipcMain.handle('desktop:auth-storage-status', () => {
+    return {
+      encrypted: authVault ? authVault.isPersistentEncryptionAvailable() : false
+    };
   });
 
   ipcMain.handle('desktop:settings-get', () => settingsStore.get());
@@ -201,24 +223,49 @@ async function runSmokeCheck(win) {
         if (!bridge) return { bridgeReady: false };
         const info = await bridge.getAppInfo();
         const updater = await bridge.updater.getState();
+        const authVaultStatus = await bridge.authStorage.isSecure();
+        await bridge.authStorage.setItem('seasonfetch-auth-smoke', 'ok-token');
+        const roundTrip = await bridge.authStorage.getItem('seasonfetch-auth-smoke');
+        await bridge.authStorage.removeItem('seasonfetch-auth-smoke');
         const health = await bridge.apiRequest({ method: 'GET', path: '/api/health' });
         const search = await bridge.apiRequest({ method: 'GET', path: '/api/cinemeta/search?q=breaking%20bad&type=series&mode=autocomplete' });
+        const geminiStatus = await bridge.apiRequest({ method: 'GET', path: '/api/gemini/status' });
+        const torrentioMovie = await bridge.apiRequest({ method: 'GET', path: '/api/torrentio/movie/tt0133093?preference=best-overall&audio=any&resolution=1080p', timeoutMs: 20000 });
+        const libraryUnauth = await bridge.apiRequest({ method: 'GET', path: '/api/library' });
         return {
           bridgeReady: true,
           title: document.title,
           info,
           updaterStatus: updater.status,
+          authVaultEncrypted: authVaultStatus.encrypted,
+          authVaultRoundTrip: roundTrip === 'ok-token',
           healthOk: health.ok,
           healthStatus: health.status,
           searchOk: search.ok,
           searchCount: Array.isArray(search.data?.results) ? search.data.results.length : 0,
-          topResult: search.data?.results?.[0]?.title || null
+          topResult: search.data?.results?.[0]?.title || null,
+          geminiStatusOk: geminiStatus.ok,
+          geminiConfigured: Boolean(geminiStatus.data?.configured),
+          torrentioMovieOk: torrentioMovie.ok,
+          torrentioMovieSources: Array.isArray(torrentioMovie.data?.sources) ? torrentioMovie.data.sources.length : 0,
+          torrentioSelectedProvider: torrentioMovie.data?.selected?.provider || null,
+          libraryUnauthStatus: libraryUnauth.status
         };
       })();
     `);
 
-    console.log(JSON.stringify({ smokeTest: 'passed', probe }, null, 2));
-    app.exit(probe && probe.bridgeReady && probe.healthOk && probe.searchOk ? 0 : 1);
+    const passed = Boolean(
+      probe
+      && probe.bridgeReady
+      && probe.authVaultRoundTrip
+      && probe.healthOk
+      && probe.searchOk
+      && probe.geminiStatusOk
+      && probe.torrentioMovieOk
+      && probe.libraryUnauthStatus === 401
+    );
+    console.log(JSON.stringify({ smokeTest: passed ? 'passed' : 'failed', probe }, null, 2));
+    app.exit(passed ? 0 : 1);
   } catch (error) {
     console.error(JSON.stringify({ smokeTest: 'failed', error: error instanceof Error ? error.message : String(error) }));
     app.exit(1);
@@ -239,6 +286,11 @@ app.whenReady().then(() => {
     filePath: path.join(app.getPath('userData'), 'settings.json'),
     allowLocalhost: isDev,
     envBackendUrl: process.env.SEASONFETCH_BACKEND_URL || ''
+  });
+
+  authVault = createAuthVault({
+    filePath: path.join(app.getPath('userData'), 'auth-vault.json'),
+    safeStorage
   });
 
   const initialSettings = settingsStore.get();

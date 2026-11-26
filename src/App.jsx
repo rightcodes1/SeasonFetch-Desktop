@@ -1,4 +1,9 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  RANKING_PREFERENCES,
+  normalizeRankingPreference,
+  rankingPreferenceDescription
+} from '../shared/rankingPreferences.js';
 import {
   checkForUpdates,
   downloadAvailableUpdate,
@@ -14,6 +19,11 @@ import {
   subscribeUpdaterStatus,
   updateDesktopSettings
 } from './services/desktopApi.js';
+import { authConfigured, supabase } from './services/supabase.js';
+import { torrentio } from './services/torrentio.js';
+import { geminiApi } from './services/gemini.js';
+import { useAuthController } from './auth/useAuthController.js';
+import { usePersonalLibrary } from './hooks/usePersonalLibrary.js';
 import { createSearchCoordinator } from './utils/searchCoordinator.js';
 import {
   createAutocompleteCache,
@@ -22,18 +32,43 @@ import {
   normalizeMediaType,
   normalizeSearchQueryText
 } from './utils/searchSession.js';
+import { createScanCoordinator } from './utils/scanCoordinator.js';
+import {
+  getEpisodeReleaseFields,
+  getReleaseIdentity,
+  restoreEpisodeRecommendation,
+  selectEpisodeRelease
+} from './utils/releaseSelection.js';
+import {
+  AUDIO_PREFERENCES,
+  RESOLUTION_PREFERENCES,
+  getNoSourceCopy,
+  getResolutionSummaryCopy
+} from './utils/resolutionDisplay.js';
+import { toGeminiCandidate } from './utils/geminiCandidates.js';
+import { copyTextToClipboard } from './utils/clipboard.js';
 import { UpdateBanner } from './components/UpdateBanner.jsx';
-
-const NAV_ITEMS = [
-  { id: 'discover', label: 'Discover', subtitle: 'Search & Catalog' },
-  { id: 'updates', label: 'Updates', subtitle: 'Channels & Status' },
-  { id: 'settings', label: 'Settings', subtitle: 'Desktop Preferences' }
-];
+import { AuthModal } from './components/AuthModal.jsx';
+import { ReleaseComparison } from './components/ReleaseComparison.jsx';
+import { SaveToLibraryControl } from './components/SaveToLibraryControl.jsx';
+import { LibraryView } from './components/LibraryView.jsx';
+import { GeminiInsightBox } from './components/GeminiInsightBox.jsx';
 
 function formatTitleInitials(title) {
   const words = String(title || 'SF').trim().split(/\s+/).filter(Boolean);
   if (words.length >= 2) return `${words[0][0]}${words[1][0]}`.toUpperCase();
   return String(title || 'SF').slice(0, 2).toUpperCase();
+}
+
+function getEpisodeNumber(row, index) {
+  return Number.isInteger(row?.number) && row.number > 0 ? row.number : index + 1;
+}
+
+function statusBadgeLabel(status) {
+  if (status === 'selected') return 'Selected';
+  if (status === 'size-unknown') return 'Size unknown';
+  if (status === 'provider-error') return 'Provider error';
+  return 'Unavailable';
 }
 
 export default function App() {
@@ -42,7 +77,14 @@ export default function App() {
   const [settings, setSettings] = useState(null);
   const [updater, setUpdater] = useState(null);
   const [health, setHealth] = useState({ status: 'checking', latencyMs: null, error: null });
+  const [geminiAvailable, setGeminiAvailable] = useState(false);
 
+  const [toast, setToast] = useState('');
+  const [globalNotice, setGlobalNotice] = useState(null);
+  const [showAuthModal, setShowAuthModal] = useState(false);
+  const [authContextNote, setAuthContextNote] = useState('');
+
+  // Search & discovery state
   const [mediaType, setMediaType] = useState('series');
   const [query, setQuery] = useState('');
   const [suggestions, setSuggestions] = useState([]);
@@ -51,16 +93,91 @@ export default function App() {
   const [resolution, setResolution] = useState(null);
   const [searching, setSearching] = useState(false);
   const [searchError, setSearchError] = useState('');
+  const [geminiQueries, setGeminiQueries] = useState([]);
+  const [geminiAssistLoading, setGeminiAssistLoading] = useState(false);
+
+  // Selected title & Torrentio release intelligence state
   const [selectedItem, setSelectedItem] = useState(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [detailError, setDetailError] = useState('');
+  const [season, setSeason] = useState(1);
+  const [episodes, setEpisodes] = useState([]);
+  const [seasonIntegrity, setSeasonIntegrity] = useState(null);
+  const [movieRelease, setMovieRelease] = useState(null);
+  const [checkingSources, setCheckingSources] = useState(false);
+  const [providerMode, setProviderMode] = useState('ready');
+  const [expandedCompare, setExpandedCompare] = useState({});
+  const [geminiExplain, setGeminiExplain] = useState({});
+  const [geminiExplainLoading, setGeminiExplainLoading] = useState({});
+
+  // Ranking & filter preferences
+  const [rankingPreference, setRankingPreference] = useState('smallest-acceptable');
+  const [audioPreference, setAudioPreference] = useState('any');
+  const [resolutionPreference, setResolutionPreference] = useState('1080p');
+  const [showAdvancedFilters, setShowAdvancedFilters] = useState(false);
+  const [minSeeders, setMinSeeders] = useState('');
+  const [maxSizeGb, setMaxSizeGb] = useState('');
+  const [codecFilter, setCodecFilter] = useState('');
+  const [hdrFilter, setHdrFilter] = useState('');
   const [settingsNotice, setSettingsNotice] = useState('');
 
   const autocompleteCoordinator = useMemo(() => createSearchCoordinator(), []);
   const autocompleteCache = useMemo(() => createAutocompleteCache(), []);
+  const scanCoordinator = useMemo(
+    () => createScanCoordinator({ onCheckingChange: setCheckingSources }),
+    []
+  );
   const searchInputRef = useRef(null);
+  const toastTimerRef = useRef(null);
+  const detailRequestRef = useRef(0);
 
-  async function refreshHealth() {
+  const showToast = useCallback(message => {
+    setToast(message);
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    toastTimerRef.current = setTimeout(() => {
+      setToast('');
+      toastTimerRef.current = null;
+    }, 2600);
+  }, []);
+
+  const showNotice = useCallback((message, hint = '') => {
+    if (!message) {
+      setGlobalNotice(null);
+      return;
+    }
+    setGlobalNotice({ message, hint });
+  }, []);
+
+  const auth = useAuthController({
+    supabase,
+    onToast: showToast,
+    onNotice: message => showNotice(message)
+  });
+
+  const openSignInPrompt = useCallback(snapshot => {
+    if (!supabase) {
+      showNotice('Supabase authentication is not configured for this desktop build.');
+      return;
+    }
+    setAuthContextNote(
+      snapshot?.payload?.title
+        ? `Sign in to save "${snapshot.payload.title}" to your synced Personal Library.`
+        : ''
+    );
+    setShowAuthModal(true);
+  }, [showNotice]);
+
+  const library = usePersonalLibrary({
+    supabase,
+    user: auth.authenticatedUser,
+    suspended: auth.suspended,
+    onRequireAuth: openSignInPrompt,
+    onSessionExpired: auth.handleSessionExpired,
+    onToast: showToast,
+    onNotice: message => showNotice(message)
+  });
+
+  const refreshHealth = useCallback(async () => {
     setHealth(prev => ({ ...prev, status: 'checking', error: null }));
     const res = await fetchBackendHealth();
     if (res.ok) {
@@ -70,6 +187,9 @@ export default function App() {
         error: null,
         payload: res.data
       });
+      if (res.data?.gemini === 'configured') {
+        setGeminiAvailable(true);
+      }
     } else {
       setHealth({
         status: 'offline',
@@ -77,16 +197,26 @@ export default function App() {
         error: res.error || 'SeasonFetch backend is unreachable.'
       });
     }
-  }
+  }, []);
 
   useEffect(() => {
     let active = true;
-    Promise.all([getAppInfo(), getDesktopSettings(), getUpdaterState()]).then(
-      ([info, loadedSettings, updaterState]) => {
+    Promise.all([getAppInfo(), getDesktopSettings(), getUpdaterState(), geminiApi.getStatus()]).then(
+      ([info, loadedSettings, updaterState, geminiStatus]) => {
         if (!active) return;
         setAppInfo(info);
         setSettings(loadedSettings);
         setUpdater(updaterState);
+        setGeminiAvailable(Boolean(geminiStatus?.configured));
+        if (loadedSettings?.rankingPreference) {
+          setRankingPreference(normalizeRankingPreference(loadedSettings.rankingPreference));
+        }
+        if (loadedSettings?.audioPreference) {
+          setAudioPreference(loadedSettings.audioPreference);
+        }
+        if (loadedSettings?.resolutionPreference) {
+          setResolutionPreference(loadedSettings.resolutionPreference);
+        }
       }
     );
 
@@ -108,13 +238,102 @@ export default function App() {
       active = false;
       unsubscribe();
       autocompleteCoordinator.invalidate();
+      scanCoordinator.invalidate();
+      if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
       window.removeEventListener('keydown', handleKeyDown);
     };
-  }, [autocompleteCoordinator]);
+  }, [autocompleteCoordinator, scanCoordinator, refreshHealth]);
+
+  const activeFiltersPayload = useMemo(() => {
+    const filters = { resolution: resolutionPreference };
+    if (minSeeders !== '' && Number.isInteger(Number(minSeeders)) && Number(minSeeders) >= 0) {
+      filters.minSeeders = Number(minSeeders);
+    }
+    if (maxSizeGb !== '' && Number.isFinite(Number(maxSizeGb)) && Number(maxSizeGb) > 0) {
+      filters.maxSizeGb = Number(maxSizeGb);
+    }
+    if (codecFilter) filters.codec = codecFilter;
+    if (hdrFilter) filters.hdr = hdrFilter;
+    return filters;
+  }, [resolutionPreference, minSeeders, maxSizeGb, codecFilter, hdrFilter]);
+
+  async function handleSettingsPatch(patch, { silent = false } = {}) {
+    if (!silent) setSettingsNotice('');
+    const result = await updateDesktopSettings(patch);
+    if (result?.ok) {
+      setSettings(result.settings);
+      if (!silent) {
+        setSettingsNotice('Preferences saved.');
+        setTimeout(() => setSettingsNotice(''), 2400);
+      }
+    } else if (!silent) {
+      setSettingsNotice(result?.error || 'Could not save desktop preferences.');
+    }
+  }
+
+  function handleRankingChange(nextValue) {
+    const normalized = normalizeRankingPreference(nextValue);
+    setRankingPreference(normalized);
+    scanCoordinator.invalidate();
+    setEpisodes([]);
+    setMovieRelease(null);
+    setSeasonIntegrity(null);
+    setExpandedCompare({});
+    setProviderMode('ready');
+    handleSettingsPatch({ rankingPreference: normalized }, { silent: true });
+    showToast(`Profile set to ${RANKING_PREFERENCES.find(p => p.value === normalized)?.label || normalized}`);
+  }
+
+  function handleAudioChange(nextValue) {
+    setAudioPreference(nextValue);
+    scanCoordinator.invalidate();
+    setEpisodes([]);
+    setMovieRelease(null);
+    setSeasonIntegrity(null);
+    setExpandedCompare({});
+    setProviderMode('ready');
+    handleSettingsPatch({ audioPreference: nextValue }, { silent: true });
+  }
+
+  function handleResolutionChange(nextValue) {
+    setResolutionPreference(nextValue);
+    scanCoordinator.invalidate();
+    setEpisodes([]);
+    setMovieRelease(null);
+    setSeasonIntegrity(null);
+    setExpandedCompare({});
+    setProviderMode('ready');
+    handleSettingsPatch({ resolutionPreference: nextValue }, { silent: true });
+  }
+
+  async function handleOpenMagnet(magnet) {
+    if (!magnet) return;
+    const result = await openExternalUrl(magnet);
+    if (result?.ok) {
+      showNotice(null);
+      showToast('Handed magnet URI off to Windows default client');
+    } else {
+      showNotice(
+        result?.error || 'Could not open magnet URI with your operating system.',
+        result?.hint || 'You can copy the magnet link and paste it into your download client.'
+      );
+    }
+  }
+
+  async function handleCopyText(text, successLabel) {
+    try {
+      await copyTextToClipboard(text);
+      showNotice(null);
+      showToast(successLabel);
+    } catch (error) {
+      showNotice(error.message || 'Unable to copy to clipboard.');
+    }
+  }
 
   function handleQueryChange(nextValue) {
     setQuery(nextValue);
     setSearchError('');
+    setGeminiQueries([]);
     const clean = normalizeSearchQueryText(nextValue);
     if (clean.length < 2) {
       autocompleteCoordinator.invalidate();
@@ -145,23 +364,27 @@ export default function App() {
     }, 240);
   }
 
-  async function handleSearchSubmit(event) {
-    event?.preventDefault();
-    const clean = normalizeSearchQueryText(query);
+  async function runFullSearch(overrideQuery, overrideMediaType) {
+    const activeMode = normalizeMediaType(overrideMediaType || mediaType);
+    const clean = normalizeSearchQueryText(overrideQuery ?? query);
     if (clean.length < 2) {
       setSearchError('Enter at least 2 characters or an IMDb ID (for example tt0903747).');
       return;
     }
 
     autocompleteCoordinator.invalidate();
+    scanCoordinator.invalidate();
     setSuggestions([]);
     setSuggestionsLoading(false);
     setSelectedItem(null);
+    setEpisodes([]);
+    setMovieRelease(null);
+    setSeasonIntegrity(null);
     setDetailError('');
     setSearchError('');
     setSearching(true);
 
-    const response = await searchCatalog(clean, mediaType, 'full');
+    const response = await searchCatalog(clean, activeMode, 'full');
     setSearching(false);
 
     if (!response.ok) {
@@ -171,24 +394,150 @@ export default function App() {
       return;
     }
 
-    const filtered = filterResultsByMediaType(response.data?.results, mediaType);
+    const filtered = filterResultsByMediaType(response.data?.results, activeMode);
     setResults(filtered);
     setResolution(response.data?.resolution || null);
     if (filtered.length === 0) {
-      setSearchError(`No ${mediaType === 'movie' ? 'movies' : 'series'} found for "${clean}".`);
+      setSearchError(`No ${activeMode === 'movie' ? 'movies' : 'series'} found for "${clean}".`);
     }
   }
 
-  async function handleSelectTitle(item) {
-    if (!item?.id) return;
+  async function handleSearchSubmit(event) {
+    event?.preventDefault();
+    await runFullSearch(query, mediaType);
+  }
+
+  async function handleGeminiSearchAssist() {
+    const clean = normalizeSearchQueryText(query);
+    if (clean.length < 2) return;
+    setGeminiAssistLoading(true);
+    setGeminiQueries([]);
+    try {
+      const suggested = await geminiApi.searchAssist(clean);
+      setGeminiQueries(suggested);
+      if (!suggested.length) {
+        showNotice('Gemini did not suggest alternate titles for this query.');
+      }
+    } catch (error) {
+      showNotice(error.message || 'Gemini search assist is currently unavailable.');
+    } finally {
+      setGeminiAssistLoading(false);
+    }
+  }
+
+  const scanMovieSources = useCallback((movie, overrideFilters) => {
+    const movieId = movie?.imdbId || movie?.id;
+    if (!movieId || !/^tt\d+$/.test(movieId)) return;
+
+    const usedFilters = overrideFilters || activeFiltersPayload;
+    setMovieRelease(null);
+    setExpandedCompare({});
+    setGeminiExplain({});
+    setProviderMode('ready');
+
+    scanCoordinator.start({
+      delayMs: 250,
+      request: () => torrentio.getMovieSources(movieId, rankingPreference, audioPreference, usedFilters),
+      onSuccess: data => {
+        const recommended = data?.selected || null;
+        const candidates = Array.isArray(data?.sources) ? [...data.sources] : [];
+        const recommendedId = getReleaseIdentity(recommended);
+        if (recommended && recommendedId && !candidates.some(c => getReleaseIdentity(c) === recommendedId)) {
+          candidates.unshift(recommended);
+        }
+        const fields = recommended ? getEpisodeReleaseFields(recommended) : null;
+        const sourceError = recommended && !fields?.magnet
+          ? 'Torrentio returned a recommended release without a valid matching magnet.'
+          : data?.status === 'unavailable'
+            ? getNoSourceCopy(usedFilters.resolution)
+            : '';
+
+        setMovieRelease({
+          id: `movie-${movieId}`,
+          title: movie.title,
+          ...(fields || {
+            status: data?.status === 'size-unknown' ? 'size-unknown' : 'unavailable',
+            size: '—',
+            format: '',
+            hash: '',
+            magnet: '',
+            rawMagnet: '',
+            sourceUrl: '',
+            provider: '',
+            resolution: null,
+            seeders: null,
+            audio: null,
+            audioEvidence: 'unverified',
+            releaseType: null,
+            releaseGroup: null
+          }),
+          status: fields?.status || (data?.status === 'size-unknown' ? 'size-unknown' : 'unavailable'),
+          selectionReason: data?.selectionReason || '',
+          intelligence: data?.intelligence || null,
+          sourceCount: candidates.length,
+          sourceError,
+          candidates,
+          recommendedSource: recommended,
+          recommendedSelectionId: recommendedId,
+          activeSelectionId: recommendedId,
+          manualSelectionId: '',
+          recommendedSelectionReason: data?.selectionReason || ''
+        });
+        setProviderMode('live');
+        showToast(`${movie.title} Torrentio lookup complete`);
+      },
+      onError: error => {
+        setMovieRelease({
+          id: `movie-${movieId}`,
+          title: movie.title,
+          status: 'provider-error',
+          size: '—',
+          format: '',
+          hash: '',
+          magnet: '',
+          candidates: [],
+          sourceCount: 0,
+          sourceError: error.message || 'Torrentio could not retrieve movie releases.'
+        });
+        setProviderMode('error');
+      }
+    });
+  }, [activeFiltersPayload, audioPreference, rankingPreference, scanCoordinator, showToast]);
+
+  const handleSelectTitle = useCallback(async (item, forcedMediaType) => {
+    const imdbId = item?.imdbId || item?.id;
+    if (!imdbId) return;
+
+    const itemType = normalizeMediaType(forcedMediaType || item.mediaType || mediaType);
+    const requestId = ++detailRequestRef.current;
+
     autocompleteCoordinator.invalidate();
+    scanCoordinator.invalidate();
+    setActiveTab('discover');
+    setMediaType(itemType);
     setSuggestions([]);
-    setSelectedItem(item);
+    setEpisodes([]);
+    setSeasonIntegrity(null);
+    setMovieRelease(null);
+    setExpandedCompare({});
+    setGeminiExplain({});
+    setProviderMode('ready');
     setDetailError('');
     setDetailLoading(true);
 
-    const itemType = normalizeMediaType(item.mediaType || mediaType);
-    const response = await fetchMediaDetail(item.id, itemType);
+    const baseItem = {
+      ...item,
+      id: imdbId,
+      imdbId,
+      mediaType: itemType,
+      poster: item.poster || item.posterUrl || null,
+      year: item.year || item.releaseYear || null,
+      imdbRating: item.imdbRating || item.rating || null
+    };
+    setSelectedItem(baseItem);
+
+    const response = await fetchMediaDetail(imdbId, itemType);
+    if (requestId !== detailRequestRef.current) return;
     setDetailLoading(false);
 
     if (!response.ok) {
@@ -196,13 +545,158 @@ export default function App() {
       return;
     }
 
-    const detail = response.data?.series || response.data?.movie || response.data;
-    if (detail && typeof detail === 'object') {
-      setSelectedItem(prev => ({
-        ...prev,
-        ...detail,
-        mediaType: itemType
-      }));
+    if (itemType === 'movie') {
+      const movieMeta = response.data?.movie || response.data || {};
+      const fullMovie = { ...baseItem, ...movieMeta, id: imdbId, imdbId, mediaType: 'movie' };
+      setSelectedItem(fullMovie);
+      scanMovieSources(fullMovie);
+      return;
+    }
+
+    const seriesMeta = response.data?.series || {};
+    const remoteEpisodes = Object.fromEntries(
+      Object.entries(response.data?.episodes || {}).map(([seasonKey, list]) => [
+        seasonKey,
+        (Array.isArray(list) ? list : []).map((ep, idx) => ({
+          title: ep.title || `Episode ${idx + 1}`,
+          number: getEpisodeNumber(ep, idx)
+        }))
+      ])
+    );
+    const seasonNumbers = Object.keys(remoteEpisodes)
+      .map(Number)
+      .filter(Number.isInteger)
+      .sort((a, b) => a - b);
+
+    const initialSeason = seasonNumbers.includes(1) ? 1 : (seasonNumbers[0] ?? 1);
+    setSeason(initialSeason);
+    setSelectedItem({
+      ...baseItem,
+      ...seriesMeta,
+      id: imdbId,
+      imdbId,
+      mediaType: 'series',
+      episodesBySeason: remoteEpisodes,
+      seasonNumbers: seasonNumbers.length ? seasonNumbers : [1],
+      seasons: seasonNumbers.length || seriesMeta.seasons || 1
+    });
+  }, [autocompleteCoordinator, mediaType, scanCoordinator, scanMovieSources]);
+
+  function handleCheckSeasonSources() {
+    if (!selectedItem || selectedItem.mediaType !== 'series') return;
+    const baseRows = selectedItem.episodesBySeason?.[season] || [];
+    if (!baseRows.length) {
+      showNotice(`No episode metadata is available for ${season === 0 ? 'Specials' : `Season ${season}`}.`);
+      return;
+    }
+
+    const episodeNumbers = baseRows.map(getEpisodeNumber);
+    setEpisodes([]);
+    setSeasonIntegrity(null);
+    setExpandedCompare({});
+    setGeminiExplain({});
+    setProviderMode('ready');
+
+    scanCoordinator.start({
+      delayMs: 250,
+      request: () => torrentio.getSeasonSources(
+        selectedItem.imdbId,
+        season,
+        episodeNumbers,
+        rankingPreference,
+        audioPreference,
+        activeFiltersPayload
+      ),
+      onSuccess: data => {
+        const providerResults = Array.isArray(data?.results) ? data.results : [];
+        const mapped = baseRows.map((row, index) => {
+          const epNum = episodeNumbers[index];
+          const provider = providerResults.find(entry => entry.episode === epNum);
+          const source = provider?.selected || null;
+          const status = provider?.status === 'error' ? 'provider-error' : (provider?.status || 'unavailable');
+          const fields = source ? getEpisodeReleaseFields(source) : null;
+          const candidates = Array.isArray(provider?.sources) ? provider.sources : [];
+          const selectionId = getReleaseIdentity(source);
+
+          return {
+            id: `${selectedItem.imdbId}-${season}-${epNum}`,
+            number: epNum,
+            title: row.title || `Episode ${epNum}`,
+            ...(fields || {}),
+            size: fields?.size || (status === 'unavailable' ? '—' : 'Unknown'),
+            status: fields?.status || status,
+            selectionReason: provider?.selectionReason || '',
+            intelligence: provider?.intelligence || null,
+            sourceCount: candidates.length,
+            sourceError: provider?.error || (source && !fields?.magnet ? 'Selected source lacks a valid matching magnet.' : ''),
+            candidates,
+            recommendedSource: source,
+            recommendedSelectionId: selectionId,
+            activeSelectionId: selectionId,
+            manualSelectionId: '',
+            recommendedSelectionReason: provider?.selectionReason || ''
+          };
+        });
+
+        setEpisodes(mapped);
+        setSeasonIntegrity(data?.integrity || null);
+        setProviderMode(data?.status === 'partial' ? 'partial' : data?.status === 'error' ? 'error' : 'live');
+        if (data?.status === 'partial') {
+          showNotice(`${data.providerErrors || 'Some'} episode requests failed; available Torrentio results are shown.`);
+        } else if (data?.status === 'error') {
+          showNotice('Torrentio could not answer episode requests. Retry shortly.');
+        }
+        showToast(`Season ${season} Torrentio scan complete`);
+      },
+      onError: error => {
+        setProviderMode('error');
+        showNotice(error.message || 'Torrentio season scan failed. Try again shortly.');
+      }
+    });
+  }
+
+  function handleSelectManualEpisodeRelease(episodeId, candidate) {
+    setEpisodes(current => selectEpisodeRelease(current, episodeId, candidate));
+    showToast('Switched to manually selected release');
+  }
+
+  function handleRestoreEpisodeRecommendation(episodeId) {
+    setEpisodes(current => restoreEpisodeRecommendation(current, episodeId));
+    showToast('Restored automatic recommendation');
+  }
+
+  function handleSelectManualMovieRelease(candidate) {
+    if (!movieRelease) return;
+    const updated = selectEpisodeRelease([movieRelease], movieRelease.id, candidate)[0];
+    setMovieRelease(updated);
+    showToast('Switched to manually selected movie release');
+  }
+
+  function handleRestoreMovieRecommendation() {
+    if (!movieRelease) return;
+    const updated = restoreEpisodeRecommendation([movieRelease], movieRelease.id)[0];
+    setMovieRelease(updated);
+    showToast('Restored automatic movie recommendation');
+  }
+
+  async function handleExplainWithGemini(targetItem, { isMovie = false } = {}) {
+    if (!targetItem?.id) return;
+    setGeminiExplainLoading(prev => ({ ...prev, [targetItem.id]: true }));
+    setGeminiExplain(prev => ({ ...prev, [targetItem.id]: null }));
+
+    const candidates = (targetItem.candidates?.length ? targetItem.candidates : [targetItem]).map(toGeminiCandidate);
+    try {
+      const data = await geminiApi.explainSource({
+        seriesTitle: selectedItem?.title || targetItem.title,
+        season: isMovie ? undefined : season,
+        episode: isMovie ? undefined : targetItem.number,
+        candidates
+      });
+      setGeminiExplain(prev => ({ ...prev, [targetItem.id]: data }));
+    } catch (error) {
+      setGeminiExplain(prev => ({ ...prev, [targetItem.id]: { error: error.message } }));
+    } finally {
+      setGeminiExplainLoading(prev => ({ ...prev, [targetItem.id]: false }));
     }
   }
 
@@ -211,28 +705,55 @@ export default function App() {
     if (normalized === mediaType) return;
     setMediaType(normalized);
     autocompleteCoordinator.invalidate();
+    scanCoordinator.invalidate();
     setSuggestions([]);
     setResults([]);
     setResolution(null);
     setSelectedItem(null);
+    setEpisodes([]);
+    setMovieRelease(null);
+    setSeasonIntegrity(null);
     setSearchError('');
+    setGeminiQueries([]);
   }
 
-  async function handleSettingsPatch(patch) {
-    setSettingsNotice('');
-    const result = await updateDesktopSettings(patch);
-    if (result?.ok) {
-      setSettings(result.settings);
-      setSettingsNotice('Preferences saved.');
-      setTimeout(() => setSettingsNotice(''), 2500);
-    } else {
-      setSettingsNotice(result?.error || 'Could not save desktop preferences.');
-    }
-  }
+  const seasonMagnets = useMemo(
+    () => episodes.filter(ep => ep.magnet).map(ep => ep.magnet),
+    [episodes]
+  );
+
+  const availableEpisodeCount = useMemo(
+    () => episodes.filter(ep => !['unavailable', 'provider-error'].includes(ep.status)).length,
+    [episodes]
+  );
+
+  const selectedSavedItem = selectedItem
+    ? library.getSavedItem(selectedItem, selectedItem.mediaType || mediaType)
+    : null;
+  const selectedLibraryBusy = selectedItem
+    ? library.isItemBusy(selectedItem, selectedItem.mediaType || mediaType)
+    : false;
 
   const channelLabel = (updater?.channel || settings?.updateChannel || 'stable') === 'preview'
     ? 'Preview'
     : 'Stable';
+
+  const accountDisplayName = auth.profile?.display_name
+    || auth.profile?.username
+    || auth.authenticatedUser?.user_metadata?.display_name
+    || auth.authenticatedUser?.email
+    || 'Signed in';
+
+  const navItems = [
+    { id: 'discover', label: 'Discover', subtitle: 'Search & Release Engine' },
+    {
+      id: 'library',
+      label: 'My Library',
+      subtitle: auth.authenticatedUser ? `${library.counts.total} saved titles` : 'Sign in to sync'
+    },
+    { id: 'updates', label: 'Updates', subtitle: 'Channels & Status' },
+    { id: 'settings', label: 'Settings', subtitle: 'Desktop Preferences' }
+  ];
 
   return (
     <div className="desktop-frame">
@@ -251,7 +772,7 @@ export default function App() {
         </div>
 
         <nav className="sidebar-nav" aria-label="Primary navigation">
-          {NAV_ITEMS.map(item => (
+          {navItems.map(item => (
             <button
               key={item.id}
               type="button"
@@ -265,6 +786,62 @@ export default function App() {
         </nav>
 
         <div className="sidebar-footer">
+          <div className="account-card">
+            {auth.authenticatedUser ? (
+              <>
+                <div className="account-card-top">
+                  <div>
+                    <span className="section-kicker">
+                      {auth.suspended ? 'ACCOUNT SUSPENDED' : 'SIGNED IN'}
+                    </span>
+                    <strong className="account-name">{accountDisplayName}</strong>
+                  </div>
+                  {appInfo?.authVaultEncrypted && (
+                    <span className="runtime-pill" title="Session tokens encrypted with Windows DPAPI">
+                      DPAPI
+                    </span>
+                  )}
+                </div>
+                <p className="mono-caption">{auth.authenticatedUser.email}</p>
+                {auth.profileError && (
+                  <button type="button" className="inline-link" onClick={auth.retryAccountSync}>
+                    Retry account sync
+                  </button>
+                )}
+                <div className="account-card-actions">
+                  <button
+                    type="button"
+                    className="ghost-button small-button"
+                    onClick={() => setActiveTab('library')}
+                  >
+                    Library ({library.counts.total})
+                  </button>
+                  <button type="button" className="ghost-button small-button" onClick={auth.signOut}>
+                    Sign out
+                  </button>
+                </div>
+              </>
+            ) : (
+              <>
+                <span className="section-kicker">SEASONFETCH ACCOUNT</span>
+                <p className="muted-copy compact-copy">
+                  Sync your Personal Library with SeasonFetch Web.
+                </p>
+                <button
+                  type="button"
+                  className="secondary-button small-button full-width"
+                  disabled={!authConfigured}
+                  onClick={() => {
+                    setAuthContextNote('');
+                    setShowAuthModal(true);
+                  }}
+                >
+                  {authConfigured ? 'Sign in / Register' : 'Auth not configured'}
+                </button>
+              </>
+            )}
+          </div>
+
           <div className={`status-card status-${health.status}`}>
             <div className="status-card-row">
               <span className="status-dot" />
@@ -309,17 +886,40 @@ export default function App() {
           onOpenUpdates={() => setActiveTab('updates')}
         />
 
+        {auth.sessionExpiredMessage && (
+          <div className="global-alert" role="alert">
+            <div>
+              <strong>Session notice:</strong> {auth.sessionExpiredMessage}
+            </div>
+            <button type="button" className="ghost-button small-button" onClick={auth.dismissSessionNotice}>
+              Dismiss
+            </button>
+          </div>
+        )}
+
+        {globalNotice && (
+          <div className="global-alert" role="alert">
+            <div>
+              <strong>{globalNotice.message}</strong>
+              {globalNotice.hint && <p className="alert-hint">{globalNotice.hint}</p>}
+            </div>
+            <button type="button" className="ghost-button small-button" onClick={() => setGlobalNotice(null)}>
+              Dismiss
+            </button>
+          </div>
+        )}
+
         <main className="main-stage">
           {activeTab === 'discover' && (
             <section className="stage-section">
               <header className="stage-header">
                 <div>
-                  <span className="section-kicker">SHARED SEASONFETCH BACKEND · PHASE 1 FOUNDATION</span>
+                  <span className="section-kicker">CINEMETA · TORRENTIO · RELEASE INTELLIGENCE · GEMINI</span>
                   <h1>
                     Find the right source, <span>natively.</span>
                   </h1>
                   <p className="stage-copy">
-                    Connected directly to SeasonFetch&apos;s live title-resolution and Cinemeta backend through an isolated desktop IPC bridge.
+                    Search movies and TV series, rank releases using SeasonFetch&apos;s deterministic intelligence, explain candidates with Gemini, and hand magnets straight to your download client.
                   </p>
                 </div>
                 <div className="shortcut-hint" title="Focus search">
@@ -328,21 +928,34 @@ export default function App() {
               </header>
 
               <div className="search-controls">
-                <div className="search-mode" role="group" aria-label="Media type">
-                  <button
-                    type="button"
-                    aria-pressed={mediaType === 'series'}
-                    onClick={() => handleMediaModeSwitch('series')}
-                  >
-                    Series
-                  </button>
-                  <button
-                    type="button"
-                    aria-pressed={mediaType === 'movie'}
-                    onClick={() => handleMediaModeSwitch('movie')}
-                  >
-                    Movies
-                  </button>
+                <div className="search-controls-row">
+                  <div className="search-mode" role="group" aria-label="Media type">
+                    <button
+                      type="button"
+                      aria-pressed={mediaType === 'series'}
+                      onClick={() => handleMediaModeSwitch('series')}
+                    >
+                      Series
+                    </button>
+                    <button
+                      type="button"
+                      aria-pressed={mediaType === 'movie'}
+                      onClick={() => handleMediaModeSwitch('movie')}
+                    >
+                      Movies
+                    </button>
+                  </div>
+
+                  {geminiAvailable && query.trim().length >= 2 && (
+                    <button
+                      type="button"
+                      className="secondary-button small-button"
+                      disabled={geminiAssistLoading}
+                      onClick={handleGeminiSearchAssist}
+                    >
+                      {geminiAssistLoading ? 'Asking Gemini...' : '✦ Gemini Title Assist'}
+                    </button>
+                  )}
                 </div>
 
                 <form className="search-form" onSubmit={handleSearchSubmit}>
@@ -371,6 +984,25 @@ export default function App() {
                     {searching ? 'Searching...' : 'Search'}
                   </button>
                 </form>
+
+                {geminiQueries.length > 0 && (
+                  <div className="gemini-chip-bar">
+                    <span className="section-kicker">GEMINI SUGGESTIONS:</span>
+                    {geminiQueries.map((suggestion, idx) => (
+                      <button
+                        key={idx}
+                        type="button"
+                        className="suggestion-chip"
+                        onClick={() => {
+                          setQuery(suggestion);
+                          runFullSearch(suggestion, mediaType);
+                        }}
+                      >
+                        {suggestion}
+                      </button>
+                    ))}
+                  </div>
+                )}
 
                 {(suggestionsLoading || suggestions.length > 0) && (
                   <div className="suggestions-panel" role="listbox" aria-label="Search suggestions">
@@ -413,52 +1045,474 @@ export default function App() {
               </div>
 
               {selectedItem && (
-                <div className="detail-card">
-                  <div className="detail-poster">
-                    {selectedItem.poster ? (
-                      <img src={selectedItem.poster} alt={selectedItem.title} />
-                    ) : (
-                      <span>{formatTitleInitials(selectedItem.title)}</span>
-                    )}
-                  </div>
-                  <div className="detail-body">
-                    <div className="detail-topline">
-                      <span className="section-kicker">
-                        {getMediaTypeFallbackLabel(selectedItem, mediaType).toUpperCase()} · {selectedItem.id}
-                      </span>
-                      <button
-                        type="button"
-                        className="ghost-button"
-                        onClick={() => setSelectedItem(null)}
-                      >
-                        Close
-                      </button>
-                    </div>
-                    <h2>{selectedItem.title}</h2>
-                    <div className="detail-meta">
-                      {selectedItem.year && <span>{selectedItem.year}</span>}
-                      {selectedItem.imdbRating && <span>★ {selectedItem.imdbRating}</span>}
-                      {Array.isArray(selectedItem.seasons) && selectedItem.seasons.length > 0 && (
-                        <span>{selectedItem.seasons.length} seasons indexed</span>
+                <div className="selected-workspace">
+                  <div className="detail-card">
+                    <div className="detail-poster">
+                      {selectedItem.poster ? (
+                        <img src={selectedItem.poster} alt={selectedItem.title} />
+                      ) : (
+                        <span>{formatTitleInitials(selectedItem.title)}</span>
                       )}
                     </div>
-                    {detailLoading ? (
-                      <p className="muted-copy">Loading metadata from SeasonFetch backend...</p>
-                    ) : detailError ? (
-                      <p className="error-copy">{detailError}</p>
-                    ) : (
-                      <p className="detail-overview">
-                        {selectedItem.overview || selectedItem.description || 'Metadata loaded from SeasonFetch Cinemeta bridge.'}
-                      </p>
-                    )}
-                    <div className="phase-note">
-                      Phase 2 will wire the full Torrentio season/movie release ranking, recommendation profiles, Gemini explanations, and Supabase account library directly into this detail view.
+                    <div className="detail-body">
+                      <div className="detail-topline">
+                        <span className="section-kicker">
+                          {getMediaTypeFallbackLabel(selectedItem, mediaType).toUpperCase()} · {selectedItem.imdbId}
+                        </span>
+                        <button
+                          type="button"
+                          className="ghost-button small-button"
+                          onClick={() => {
+                            scanCoordinator.invalidate();
+                            setSelectedItem(null);
+                            setEpisodes([]);
+                            setMovieRelease(null);
+                            setSeasonIntegrity(null);
+                          }}
+                        >
+                          Change {selectedItem.mediaType === 'movie' ? 'movie' : 'series'}
+                        </button>
+                      </div>
+                      <h2>{selectedItem.title}</h2>
+                      <div className="detail-meta">
+                        {selectedItem.year && <span>{selectedItem.year}</span>}
+                        {selectedItem.imdbRating && <span>★ {selectedItem.imdbRating}</span>}
+                        {selectedItem.mediaType === 'series' && selectedItem.seasonNumbers?.length > 0 && (
+                          <span>{selectedItem.seasonNumbers.length} seasons</span>
+                        )}
+                        {Array.isArray(selectedItem.genres) && selectedItem.genres.length > 0 && (
+                          <span>{selectedItem.genres.slice(0, 3).join(' · ')}</span>
+                        )}
+                      </div>
+
+                      {detailLoading ? (
+                        <p className="muted-copy">Loading metadata from SeasonFetch Cinemeta...</p>
+                      ) : detailError ? (
+                        <p className="error-copy">{detailError}</p>
+                      ) : (
+                        <p className="detail-overview">
+                          {selectedItem.synopsis || selectedItem.overview || selectedItem.description || 'Metadata loaded from SeasonFetch.'}
+                        </p>
+                      )}
+
+                      <div className="detail-library-bar">
+                        <SaveToLibraryControl
+                          media={selectedItem}
+                          fallbackMediaType={selectedItem.mediaType || mediaType}
+                          savedItem={selectedSavedItem}
+                          busy={selectedLibraryBusy}
+                          disabled={auth.suspended}
+                          onSave={library.saveItem}
+                          onUpdateStatus={library.updateStatus}
+                          onToggleFavorite={library.toggleFavorite}
+                          onRemove={library.removeItem}
+                        />
+                      </div>
                     </div>
                   </div>
+
+                  {/* Release Intelligence & Filter Bar */}
+                  <div className="panel-card intelligence-bar">
+                    <div className="intelligence-controls">
+                      <label className="control-field">
+                        <span>Ranking Profile</span>
+                        <select
+                          className="desktop-select"
+                          value={rankingPreference}
+                          onChange={event => handleRankingChange(event.target.value)}
+                        >
+                          {RANKING_PREFERENCES.map(pref => (
+                            <option key={pref.value} value={pref.value}>
+                              {pref.label} — {pref.hint}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+
+                      <label className="control-field">
+                        <span>Resolution</span>
+                        <select
+                          className="desktop-select"
+                          value={resolutionPreference}
+                          onChange={event => handleResolutionChange(event.target.value)}
+                        >
+                          {RESOLUTION_PREFERENCES.map(option => (
+                            <option key={option.value} value={option.value}>
+                              {option.label}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+
+                      <label className="control-field">
+                        <span>Audio</span>
+                        <select
+                          className="desktop-select"
+                          value={audioPreference}
+                          onChange={event => handleAudioChange(event.target.value)}
+                        >
+                          {AUDIO_PREFERENCES.map(option => (
+                            <option key={option.value} value={option.value}>
+                              {option.label}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+
+                      <div className="control-actions">
+                        <button
+                          type="button"
+                          className="ghost-button small-button"
+                          onClick={() => setShowAdvancedFilters(v => !v)}
+                        >
+                          {showAdvancedFilters ? 'Hide Filters' : 'More Filters'}
+                        </button>
+
+                        {selectedItem.mediaType === 'movie' ? (
+                          <button
+                            type="button"
+                            className="primary-button"
+                            disabled={checkingSources || detailLoading}
+                            onClick={() => scanMovieSources(selectedItem)}
+                          >
+                            {checkingSources ? 'Scanning...' : 'Check Movie Sources'}
+                          </button>
+                        ) : (
+                          <button
+                            type="button"
+                            className="primary-button"
+                            disabled={checkingSources || detailLoading}
+                            onClick={handleCheckSeasonSources}
+                          >
+                            {checkingSources ? 'Scanning...' : `Check Season ${season}`}
+                          </button>
+                        )}
+                      </div>
+                    </div>
+
+                    <p className="muted-copy compact-copy">
+                      {rankingPreferenceDescription(rankingPreference)} · {getResolutionSummaryCopy(providerMode, resolutionPreference)}
+                    </p>
+
+                    {showAdvancedFilters && (
+                      <div className="advanced-filters-grid">
+                        <label className="control-field">
+                          <span>Min Seeders</span>
+                          <input
+                            type="number"
+                            min="0"
+                            placeholder="Any"
+                            value={minSeeders}
+                            onChange={event => setMinSeeders(event.target.value)}
+                          />
+                        </label>
+                        <label className="control-field">
+                          <span>Max Size (GB)</span>
+                          <input
+                            type="number"
+                            min="0.1"
+                            step="0.5"
+                            placeholder="Any"
+                            value={maxSizeGb}
+                            onChange={event => setMaxSizeGb(event.target.value)}
+                          />
+                        </label>
+                        <label className="control-field">
+                          <span>Codec</span>
+                          <select
+                            className="desktop-select"
+                            value={codecFilter}
+                            onChange={event => setCodecFilter(event.target.value)}
+                          >
+                            <option value="">Any codec</option>
+                            <option value="H.264">H.264</option>
+                            <option value="HEVC">HEVC / x265</option>
+                            <option value="AV1">AV1</option>
+                          </select>
+                        </label>
+                        <label className="control-field">
+                          <span>HDR</span>
+                          <select
+                            className="desktop-select"
+                            value={hdrFilter}
+                            onChange={event => setHdrFilter(event.target.value)}
+                          >
+                            <option value="">Any</option>
+                            <option value="HDR">HDR</option>
+                            <option value="Dolby Vision">Dolby Vision</option>
+                          </select>
+                        </label>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* SERIES RELEASE WORKSPACE */}
+                  {selectedItem.mediaType === 'series' && (
+                    <div className="series-workspace">
+                      <div className="season-tabs-row">
+                        <div className="filter-pills" role="tablist" aria-label="Seasons">
+                          {(selectedItem.seasonNumbers || [1]).map(num => (
+                            <button
+                              key={num}
+                              type="button"
+                              role="tab"
+                              aria-selected={season === num}
+                              className={season === num ? 'active' : ''}
+                              onClick={() => {
+                                scanCoordinator.invalidate();
+                                setSeason(num);
+                                setEpisodes([]);
+                                setSeasonIntegrity(null);
+                                setExpandedCompare({});
+                                setProviderMode('ready');
+                              }}
+                            >
+                              {num === 0 ? 'Specials' : `Season ${num}`}
+                            </button>
+                          ))}
+                        </div>
+
+                        {seasonMagnets.length > 0 && (
+                          <button
+                            type="button"
+                            className="secondary-button small-button"
+                            onClick={() => handleCopyText(seasonMagnets.join('\n'), `Copied ${seasonMagnets.length} season magnets`)}
+                          >
+                            Copy All Magnets ({seasonMagnets.length})
+                          </button>
+                        )}
+                      </div>
+
+                      {seasonIntegrity && (
+                        <div className="integrity-strip">
+                          <span>
+                            <strong>{availableEpisodeCount}/{episodes.length}</strong> episodes ready
+                          </span>
+                          {seasonIntegrity.estimatedTotalSizeLabel && (
+                            <span>Est. season size: <strong>{seasonIntegrity.estimatedTotalSizeLabel}</strong></span>
+                          )}
+                          {seasonIntegrity.dominantGroup && (
+                            <span>Dominant group: <strong>{seasonIntegrity.dominantGroup}</strong></span>
+                          )}
+                          {seasonIntegrity.summary && (
+                            <span className="muted-inline">{seasonIntegrity.summary}</span>
+                          )}
+                        </div>
+                      )}
+
+                      {episodes.length === 0 ? (
+                        <div className="panel-card empty-state-card">
+                          <h3>
+                            {checkingSources
+                              ? `Scanning Season ${season} via Torrentio...`
+                              : `Season ${season} ready to scan`}
+                          </h3>
+                          <p className="muted-copy">
+                            {checkingSources
+                              ? 'Fetching episode streams and running SeasonFetch deterministic release ranking...'
+                              : `${(selectedItem.episodesBySeason?.[season] || []).length} episodes indexed. Click Check Season ${season} to evaluate live Torrentio releases.`}
+                          </p>
+                        </div>
+                      ) : (
+                        <div className="episode-list">
+                          {episodes.map(ep => {
+                            const isExpanded = Boolean(expandedCompare[ep.id]);
+                            return (
+                              <article key={ep.id} className="episode-card">
+                                <div className="episode-top">
+                                  <div className="episode-title-block">
+                                    <span className="episode-number">E{String(ep.number).padStart(2, '0')}</span>
+                                    <div>
+                                      <strong>{ep.title}</strong>
+                                      <p className="mono-caption">
+                                        {ep.format || ep.sourceError || getNoSourceCopy(resolutionPreference)}
+                                      </p>
+                                    </div>
+                                  </div>
+                                  <span className={`release-status status-${ep.status}`}>
+                                    {statusBadgeLabel(ep.status)}
+                                  </span>
+                                </div>
+
+                                <div className="episode-meta-row">
+                                  <span><b>Size:</b> {ep.size || '—'}</span>
+                                  <span><b>Resolution:</b> {ep.resolution || '—'}</span>
+                                  <span><b>Seeders:</b> {Number.isInteger(ep.seeders) ? ep.seeders.toLocaleString() : '—'}</span>
+                                  <span><b>Provider:</b> {ep.provider || '—'}</span>
+                                  <span><b>Candidates:</b> {ep.sourceCount || 0}</span>
+                                </div>
+
+                                {ep.selectionReason && (
+                                  <p className="selection-reason">{ep.selectionReason}</p>
+                                )}
+
+                                <div className="episode-actions">
+                                  {ep.magnet && (
+                                    <>
+                                      <button
+                                        type="button"
+                                        className="primary-button small-button"
+                                        onClick={() => handleOpenMagnet(ep.magnet)}
+                                      >
+                                        Open Magnet
+                                      </button>
+                                      <button
+                                        type="button"
+                                        className="secondary-button small-button"
+                                        onClick={() => handleCopyText(ep.magnet, `Copied E${ep.number} magnet`)}
+                                      >
+                                        Copy Magnet
+                                      </button>
+                                    </>
+                                  )}
+
+                                  {ep.candidates?.length > 0 && (
+                                    <button
+                                      type="button"
+                                      className="ghost-button small-button"
+                                      onClick={() => setExpandedCompare(prev => ({ ...prev, [ep.id]: !prev[ep.id] }))}
+                                    >
+                                      {isExpanded ? 'Hide Candidates' : `Compare Releases (${ep.candidates.length})`}
+                                    </button>
+                                  )}
+
+                                  {geminiAvailable && ep.candidates?.length > 0 && (
+                                    <button
+                                      type="button"
+                                      className="ghost-button small-button"
+                                      disabled={Boolean(geminiExplainLoading[ep.id])}
+                                      onClick={() => handleExplainWithGemini(ep)}
+                                    >
+                                      {geminiExplainLoading[ep.id] ? 'Analyzing...' : '✦ Ask Gemini'}
+                                    </button>
+                                  )}
+                                </div>
+
+                                <GeminiInsightBox
+                                  analysis={geminiExplain[ep.id]}
+                                  loading={Boolean(geminiExplainLoading[ep.id])}
+                                />
+
+                                {isExpanded && (
+                                  <ReleaseComparison
+                                    item={ep}
+                                    mediaLabel="episode"
+                                    onSelect={candidate => handleSelectManualEpisodeRelease(ep.id, candidate)}
+                                    onRestore={() => handleRestoreEpisodeRecommendation(ep.id)}
+                                    onOpenExternal={openExternalUrl}
+                                  />
+                                )}
+                              </article>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {/* MOVIE RELEASE WORKSPACE */}
+                  {selectedItem.mediaType === 'movie' && (
+                    <div className="panel-card movie-workspace">
+                      <div className="panel-row">
+                        <div>
+                          <span className="section-kicker">MOVIE RELEASE INTELLIGENCE</span>
+                          <h3>{selectedItem.title}</h3>
+                        </div>
+                        {movieRelease && (
+                          <span className={`release-status status-${movieRelease.status}`}>
+                            {statusBadgeLabel(movieRelease.status)}
+                          </span>
+                        )}
+                      </div>
+
+                      {checkingSources ? (
+                        <p className="muted-copy">Scanning Torrentio movie releases...</p>
+                      ) : !movieRelease ? (
+                        <p className="muted-copy">Click Check Movie Sources to scan Torrentio releases with the active ranking profile.</p>
+                      ) : (
+                        <>
+                          <p className="mono-caption">
+                            {movieRelease.format || movieRelease.sourceError || getNoSourceCopy(resolutionPreference)}
+                          </p>
+
+                          <div className="episode-meta-row">
+                            <span><b>Size:</b> {movieRelease.size || '—'}</span>
+                            <span><b>Resolution:</b> {movieRelease.resolution || '—'}</span>
+                            <span><b>Seeders:</b> {Number.isInteger(movieRelease.seeders) ? movieRelease.seeders.toLocaleString() : '—'}</span>
+                            <span><b>Provider:</b> {movieRelease.provider || '—'}</span>
+                            <span><b>Candidates:</b> {movieRelease.sourceCount || 0}</span>
+                          </div>
+
+                          {movieRelease.selectionReason && (
+                            <p className="selection-reason">{movieRelease.selectionReason}</p>
+                          )}
+
+                          <div className="episode-actions">
+                            {movieRelease.magnet && (
+                              <>
+                                <button
+                                  type="button"
+                                  className="primary-button small-button"
+                                  onClick={() => handleOpenMagnet(movieRelease.magnet)}
+                                >
+                                  Open Magnet
+                                </button>
+                                <button
+                                  type="button"
+                                  className="secondary-button small-button"
+                                  onClick={() => handleCopyText(movieRelease.magnet, 'Movie magnet link copied')}
+                                >
+                                  Copy Magnet
+                                </button>
+                              </>
+                            )}
+
+                            {movieRelease.candidates?.length > 0 && (
+                              <button
+                                type="button"
+                                className="ghost-button small-button"
+                                onClick={() => setExpandedCompare(prev => ({ ...prev, [movieRelease.id]: !prev[movieRelease.id] }))}
+                              >
+                                {expandedCompare[movieRelease.id]
+                                  ? 'Hide Candidates'
+                                  : `Compare Releases (${movieRelease.candidates.length})`}
+                              </button>
+                            )}
+
+                            {geminiAvailable && movieRelease.candidates?.length > 0 && (
+                              <button
+                                type="button"
+                                className="ghost-button small-button"
+                                disabled={Boolean(geminiExplainLoading[movieRelease.id])}
+                                onClick={() => handleExplainWithGemini(movieRelease, { isMovie: true })}
+                              >
+                                {geminiExplainLoading[movieRelease.id] ? 'Analyzing...' : '✦ Ask Gemini'}
+                              </button>
+                            )}
+                          </div>
+
+                          <GeminiInsightBox
+                            analysis={geminiExplain[movieRelease.id]}
+                            loading={Boolean(geminiExplainLoading[movieRelease.id])}
+                          />
+
+                          {expandedCompare[movieRelease.id] && (
+                            <ReleaseComparison
+                              item={movieRelease}
+                              mediaLabel="movie"
+                              onSelect={handleSelectManualMovieRelease}
+                              onRestore={handleRestoreMovieRecommendation}
+                              onOpenExternal={openExternalUrl}
+                            />
+                          )}
+                        </>
+                      )}
+                    </div>
+                  )}
                 </div>
               )}
 
-              {results.length > 0 && (
+              {!selectedItem && results.length > 0 && (
                 <div className="results-block">
                   <div className="results-header">
                     <div>
@@ -503,6 +1557,28 @@ export default function App() {
                 </div>
               )}
             </section>
+          )}
+
+          {activeTab === 'library' && (
+            <LibraryView
+              user={auth.authenticatedUser}
+              suspended={auth.suspended}
+              authConfigured={authConfigured}
+              items={library.items}
+              counts={library.counts}
+              loading={library.loading}
+              error={library.error}
+              busyKeys={library.busyKeys}
+              onSignIn={() => {
+                setAuthContextNote('');
+                setShowAuthModal(true);
+              }}
+              onRefresh={library.loadLibrary}
+              onOpenTitle={item => handleSelectTitle(item, item.mediaType)}
+              onUpdateStatus={library.updateStatus}
+              onToggleFavorite={library.toggleFavorite}
+              onRemove={library.removeItem}
+            />
           )}
 
           {activeTab === 'updates' && (
@@ -621,7 +1697,7 @@ export default function App() {
                     Desktop <span>Settings</span>
                   </h1>
                   <p className="stage-copy">
-                    Stored locally in your Windows user profile. Account credentials and user library records remain managed by SeasonFetch&apos;s backend.
+                    Non-sensitive desktop preferences are saved locally in your Windows user profile. Auth sessions are encrypted separately with Windows DPAPI.
                   </p>
                 </div>
               </header>
@@ -682,12 +1758,14 @@ export default function App() {
 
                 <div className="setting-row">
                   <div>
-                    <strong>External Magnet Protocol Handoff</strong>
+                    <strong>Session Vault Security</strong>
                     <p className="muted-copy">
-                      Uses Windows&apos; registered <code>magnet:</code> handler without hardcoding a specific torrent client. Clear recovery guidance is shown if no handler is registered.
+                      Supabase session tokens are stored via Electron <code>safeStorage</code> (Windows DPAPI) and never written in plaintext.
                     </p>
                   </div>
-                  <span className="channel-pill">OS Standard</span>
+                  <span className="channel-pill">
+                    {appInfo?.authVaultEncrypted ? 'DPAPI Active' : 'Memory Only'}
+                  </span>
                 </div>
 
                 <div className="setting-row">
@@ -706,6 +1784,28 @@ export default function App() {
           )}
         </main>
       </div>
+
+      {showAuthModal && (
+        <AuthModal
+          supabase={supabase}
+          contextNote={authContextNote}
+          onClose={outcome => {
+            setShowAuthModal(false);
+            setAuthContextNote('');
+            if (outcome !== 'authenticated') {
+              library.cancelPendingSave();
+            } else {
+              showToast('Signed in to SeasonFetch');
+            }
+          }}
+        />
+      )}
+
+      {toast && (
+        <div className="toast-pill" role="status">
+          {toast}
+        </div>
+      )}
     </div>
   );
 }

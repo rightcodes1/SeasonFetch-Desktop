@@ -1,11 +1,26 @@
+const fs = require('node:fs');
 const path = require('node:path');
-const { app, BrowserWindow, ipcMain, net, safeStorage, shell, session } = require('electron');
+const {
+  app,
+  BrowserWindow,
+  Menu,
+  dialog,
+  ipcMain,
+  net,
+  safeStorage,
+  screen,
+  shell,
+  session
+} = require('electron');
 const { autoUpdater } = require('electron-updater');
 const { createSettingsStore } = require('./services/settingsStore.cjs');
 const { createAuthVault } = require('./services/authStore.cjs');
+const { createDesktopLogger } = require('./services/logger.cjs');
+const { inspectWindowsMagnetHandler } = require('./services/magnetDiagnostics.cjs');
+const { buildApplicationMenu, createDesktopTray } = require('./services/desktopChrome.cjs');
 const { executeApiRequest } = require('./ipc/apiBridge.cjs');
 const { openExternalTarget } = require('./ipc/protocolHandler.cjs');
-const { createUpdaterController } = require('./services/updaterService.cjs');
+const { createUpdaterController, RELEASES_FALLBACK_URL } = require('./services/updaterService.cjs');
 
 const isSmokeTest = process.argv.includes('--smoke-test');
 const devUrl = process.env.SEASONFETCH_DEV_URL || '';
@@ -19,8 +34,11 @@ if (!isSmokeTest) {
 }
 
 let mainWindow = null;
+let tray = null;
+let isQuitting = false;
 let settingsStore = null;
 let authVault = null;
+let logger = null;
 let updaterController = null;
 let boundsSaveTimer = null;
 
@@ -28,6 +46,39 @@ function broadcastUpdaterState(nextState) {
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('desktop:updater-status', nextState);
   }
+}
+
+function sendNavigate(payload) {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (!mainWindow.isVisible()) mainWindow.show();
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.focus();
+  mainWindow.webContents.send('desktop:navigate', payload);
+}
+
+function clampBoundsToVisibleDisplay(bounds) {
+  const safe = { ...bounds };
+  if (!Number.isFinite(safe.x) || !Number.isFinite(safe.y)) {
+    return { width: safe.width, height: safe.height, x: undefined, y: undefined };
+  }
+  try {
+    const displays = screen.getAllDisplays();
+    const visible = displays.some(display => {
+      const wa = display.workArea;
+      return (
+        safe.x + 80 >= wa.x
+        && safe.x <= wa.x + wa.width - 80
+        && safe.y >= wa.y
+        && safe.y <= wa.y + wa.height - 80
+      );
+    });
+    if (!visible) {
+      return { width: safe.width, height: safe.height, x: undefined, y: undefined };
+    }
+  } catch {
+    return { width: safe.width, height: safe.height, x: undefined, y: undefined };
+  }
+  return safe;
 }
 
 function buildContentSecurityPolicy() {
@@ -46,15 +97,44 @@ function buildContentSecurityPolicy() {
   ].join('; ');
 }
 
+function syncTrayVisibility(enabled) {
+  if (isSmokeTest) return;
+  if (enabled && !tray) {
+    tray = createDesktopTray({
+      iconPath: path.join(__dirname, '..', 'build', 'icon.ico'),
+      onShow: () => {
+        if (!mainWindow || mainWindow.isDestroyed()) {
+          mainWindow = createMainWindow();
+          return;
+        }
+        mainWindow.show();
+        if (mainWindow.isMinimized()) mainWindow.restore();
+        mainWindow.focus();
+      },
+      onCheckUpdates: () => {
+        sendNavigate({ tab: 'updates' });
+        updaterController?.checkForUpdates({ reason: 'manual' }).catch(() => {});
+      },
+      onQuit: () => {
+        isQuitting = true;
+        app.quit();
+      }
+    });
+  } else if (!enabled && tray) {
+    tray.destroy();
+    tray = null;
+  }
+}
+
 function createMainWindow() {
   const settings = settingsStore.get();
-  const { width, height, x, y, isMaximized } = settings.windowBounds;
+  const clamped = clampBoundsToVisibleDisplay(settings.windowBounds);
 
   const win = new BrowserWindow({
-    width,
-    height,
-    x: Number.isFinite(x) ? x : undefined,
-    y: Number.isFinite(y) ? y : undefined,
+    width: clamped.width,
+    height: clamped.height,
+    x: clamped.x,
+    y: clamped.y,
     minWidth: 960,
     minHeight: 640,
     show: false,
@@ -73,13 +153,21 @@ function createMainWindow() {
     }
   });
 
-  if (isMaximized && !isSmokeTest) {
+  if (settings.windowBounds.isMaximized && !isSmokeTest) {
     win.maximize();
   }
 
   win.once('ready-to-show', () => {
     if (!isSmokeTest) {
       win.show();
+    }
+  });
+
+  win.on('close', event => {
+    const currentSettings = settingsStore.get();
+    if (!isQuitting && !isSmokeTest && currentSettings.minimizeToTray && tray) {
+      event.preventDefault();
+      win.hide();
     }
   });
 
@@ -153,14 +241,89 @@ function registerIpcHandlers() {
 
   ipcMain.handle('desktop:api-request', async (_event, request) => {
     const settings = settingsStore.get();
-    return executeApiRequest(request, {
+    const result = await executeApiRequest(request, {
       backendOrigin: settings.backendUrl,
       fetchImpl: net.fetch.bind(net)
     });
+    if (!result.ok && result.code !== 'HTTP_401') {
+      logger?.warn('api', `${request?.method || 'GET'} ${request?.path || ''} failed`, { code: result.code, status: result.status });
+    }
+    return result;
   });
 
   ipcMain.handle('desktop:open-external', async (_event, rawUrl) => {
-    return openExternalTarget(rawUrl, target => shell.openExternal(target));
+    const result = await openExternalTarget(rawUrl, target => shell.openExternal(target));
+    if (!result.ok) {
+      logger?.warn('protocol', 'External handoff failed', { code: result.code, protocol: result.protocol });
+    }
+    return result;
+  });
+
+  ipcMain.handle('desktop:inspect-magnet-handler', async () => {
+    return inspectWindowsMagnetHandler();
+  });
+
+  ipcMain.handle('desktop:save-text-file', async (_event, payload) => {
+    if (!payload || typeof payload.content !== 'string' || payload.content.length > 2 * 1024 * 1024) {
+      return { ok: false, error: 'Invalid text file payload.' };
+    }
+    const defaultName = String(payload.defaultFilename || 'seasonfetch-export.txt')
+      .replace(/[^a-z0-9._-]+/gi, '-')
+      .replace(/^-+|-+$/g, '')
+      || 'seasonfetch-export.txt';
+    const ensuredName = defaultName.toLowerCase().endsWith('.txt') ? defaultName : `${defaultName}.txt`;
+
+    const result = await dialog.showSaveDialog(mainWindow, {
+      title: String(payload.title || 'Save text file'),
+      defaultPath: path.join(app.getPath('downloads'), ensuredName),
+      filters: [{ name: 'Text Files', extensions: ['txt'] }]
+    });
+
+    if (result.canceled || !result.filePath) {
+      return { ok: false, canceled: true };
+    }
+
+    try {
+      fs.writeFileSync(result.filePath, payload.content, 'utf8');
+      return { ok: true, filePath: result.filePath };
+    } catch (error) {
+      return {
+        ok: false,
+        error: error instanceof Error ? error.message : 'Unable to write file.'
+      };
+    }
+  });
+
+  ipcMain.handle('desktop:get-diagnostics', async () => {
+    const settings = settingsStore.get();
+    const magnetHandler = await inspectWindowsMagnetHandler();
+    const updater = updaterController ? updaterController.getState() : null;
+    return {
+      generatedAt: new Date().toISOString(),
+      app: {
+        name: app.getName(),
+        version: app.getVersion(),
+        isPackaged: app.isPackaged,
+        platform: process.platform,
+        arch: process.arch,
+        electron: process.versions.electron,
+        chrome: process.versions.chrome,
+        node: process.versions.node
+      },
+      backendUrl: settings.backendUrl,
+      authVaultEncrypted: authVault ? authVault.isPersistentEncryptionAvailable() : false,
+      magnetHandler,
+      updater: updater ? {
+        status: updater.status,
+        channel: updater.channel,
+        currentVersion: updater.currentVersion,
+        availableVersion: updater.availableVersion,
+        errorCode: updater.errorCode,
+        recoveryRequired: updater.recoveryRequired,
+        lastCheckedAt: updater.lastCheckedAt
+      } : null,
+      recentLogs: logger ? logger.readRecentLines(80) : []
+    };
   });
 
   ipcMain.handle('desktop:auth-storage-get', (_event, key) => {
@@ -186,12 +349,15 @@ function registerIpcHandlers() {
 
   ipcMain.handle('desktop:settings-update', (_event, patch) => {
     const result = settingsStore.update(patch);
-    if (result.ok && updaterController) {
-      updaterController.updatePreferences({
-        channel: result.settings.updateChannel,
-        autoCheckUpdates: result.settings.autoCheckUpdates,
-        autoDownloadUpdates: result.settings.autoDownloadUpdates
-      });
+    if (result.ok) {
+      syncTrayVisibility(result.settings.minimizeToTray);
+      if (updaterController) {
+        updaterController.updatePreferences({
+          channel: result.settings.updateChannel,
+          autoCheckUpdates: result.settings.autoCheckUpdates,
+          autoDownloadUpdates: result.settings.autoDownloadUpdates
+        });
+      }
     }
     return result;
   });
@@ -199,8 +365,12 @@ function registerIpcHandlers() {
   ipcMain.handle('desktop:updater-get-state', () => updaterController.getState());
   ipcMain.handle('desktop:updater-check', () => updaterController.checkForUpdates({ reason: 'manual' }));
   ipcMain.handle('desktop:updater-download', () => updaterController.downloadUpdate());
+  ipcMain.handle('desktop:updater-dismiss-recovery', () => updaterController.dismissRecovery());
   ipcMain.handle('desktop:updater-postpone', () => updaterController.postponeInstall());
-  ipcMain.handle('desktop:updater-install-now', () => updaterController.installNow());
+  ipcMain.handle('desktop:updater-install-now', () => {
+    isQuitting = true;
+    return updaterController.installNow();
+  });
 }
 
 async function runSmokeCheck(win) {
@@ -223,6 +393,8 @@ async function runSmokeCheck(win) {
         if (!bridge) return { bridgeReady: false };
         const info = await bridge.getAppInfo();
         const updater = await bridge.updater.getState();
+        const magnetHandler = await bridge.inspectMagnetHandler();
+        const diagnostics = await bridge.getDiagnostics();
         const authVaultStatus = await bridge.authStorage.isSecure();
         await bridge.authStorage.setItem('seasonfetch-auth-smoke', 'ok-token');
         const roundTrip = await bridge.authStorage.getItem('seasonfetch-auth-smoke');
@@ -237,6 +409,8 @@ async function runSmokeCheck(win) {
           title: document.title,
           info,
           updaterStatus: updater.status,
+          magnetHandler,
+          diagnosticsReady: Boolean(diagnostics && diagnostics.app && diagnostics.app.version),
           authVaultEncrypted: authVaultStatus.encrypted,
           authVaultRoundTrip: roundTrip === 'ok-token',
           healthOk: health.ok,
@@ -248,7 +422,6 @@ async function runSmokeCheck(win) {
           geminiConfigured: Boolean(geminiStatus.data?.configured),
           torrentioMovieOk: torrentioMovie.ok,
           torrentioMovieSources: Array.isArray(torrentioMovie.data?.sources) ? torrentioMovie.data.sources.length : 0,
-          torrentioSelectedProvider: torrentioMovie.data?.selected?.provider || null,
           libraryUnauthStatus: libraryUnauth.status
         };
       })();
@@ -257,6 +430,7 @@ async function runSmokeCheck(win) {
     const passed = Boolean(
       probe
       && probe.bridgeReady
+      && probe.diagnosticsReady
       && probe.authVaultRoundTrip
       && probe.healthOk
       && probe.searchOk
@@ -282,14 +456,20 @@ app.whenReady().then(() => {
     });
   });
 
+  const userDataDir = app.getPath('userData');
+  logger = createDesktopLogger({
+    filePath: path.join(userDataDir, 'logs', 'desktop.log')
+  });
+  logger.info('app', 'SeasonFetch Desktop starting', { version: app.getVersion(), isPackaged: app.isPackaged });
+
   settingsStore = createSettingsStore({
-    filePath: path.join(app.getPath('userData'), 'settings.json'),
+    filePath: path.join(userDataDir, 'settings.json'),
     allowLocalhost: isDev,
     envBackendUrl: process.env.SEASONFETCH_BACKEND_URL || ''
   });
 
   authVault = createAuthVault({
-    filePath: path.join(app.getPath('userData'), 'auth-vault.json'),
+    filePath: path.join(userDataDir, 'auth-vault.json'),
     safeStorage
   });
 
@@ -301,11 +481,30 @@ app.whenReady().then(() => {
     autoCheckUpdates: initialSettings.autoCheckUpdates,
     autoDownloadUpdates: initialSettings.autoDownloadUpdates,
     autoUpdater,
+    stateFilePath: path.join(userDataDir, 'updater-state.json'),
+    logger,
     onStateChange: broadcastUpdaterState
   });
 
   registerIpcHandlers();
   if (!isSmokeTest) {
+    Menu.setApplicationMenu(
+      buildApplicationMenu({
+        isDev,
+        onNavigate: tab => sendNavigate({ tab }),
+        onFocusSearch: () => sendNavigate({ tab: 'discover', focusSearch: true }),
+        onCheckUpdates: () => {
+          sendNavigate({ tab: 'updates' });
+          updaterController.checkForUpdates({ reason: 'manual' }).catch(() => {});
+        },
+        onOpenReleases: () => openExternalTarget(RELEASES_FALLBACK_URL, target => shell.openExternal(target)).catch(() => {}),
+        onQuit: () => {
+          isQuitting = true;
+          app.quit();
+        }
+      })
+    );
+    syncTrayVisibility(initialSettings.minimizeToTray);
     updaterController.start();
   }
 
@@ -316,14 +515,23 @@ app.whenReady().then(() => {
   }
 });
 
+app.on('before-quit', () => {
+  isQuitting = true;
+});
+
 app.on('second-instance', () => {
   if (!mainWindow) return;
+  if (!mainWindow.isVisible()) mainWindow.show();
   if (mainWindow.isMinimized()) mainWindow.restore();
   mainWindow.focus();
 });
 
 app.on('window-all-closed', () => {
   if (updaterController) updaterController.dispose();
+  if (tray) {
+    tray.destroy();
+    tray = null;
+  }
   if (process.platform !== 'darwin') {
     app.quit();
   }

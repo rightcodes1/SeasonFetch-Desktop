@@ -6,16 +6,21 @@ import {
 } from '../shared/rankingPreferences.js';
 import {
   checkForUpdates,
+  dismissUpdaterRecovery,
   downloadAvailableUpdate,
   fetchBackendHealth,
   fetchMediaDetail,
   getAppInfo,
+  getDesktopDiagnostics,
   getDesktopSettings,
   getUpdaterState,
+  inspectMagnetHandler,
   installDownloadedUpdate,
   openExternalUrl,
   postponeUpdateInstall,
+  saveTextFile,
   searchCatalog,
+  subscribeDesktopNavigation,
   subscribeUpdaterStatus,
   updateDesktopSettings
 } from './services/desktopApi.js';
@@ -76,7 +81,9 @@ export default function App() {
   const [appInfo, setAppInfo] = useState(null);
   const [settings, setSettings] = useState(null);
   const [updater, setUpdater] = useState(null);
+  const [magnetHandler, setMagnetHandler] = useState(null);
   const [health, setHealth] = useState({ status: 'checking', latencyMs: null, error: null });
+  const [isOnline, setIsOnline] = useState(() => (typeof navigator !== 'undefined' ? navigator.onLine : true));
   const [geminiAvailable, setGeminiAvailable] = useState(false);
 
   const [toast, setToast] = useState('');
@@ -140,12 +147,12 @@ export default function App() {
     }, 2600);
   }, []);
 
-  const showNotice = useCallback((message, hint = '') => {
+  const showNotice = useCallback((message, { hint = '', magnetFallback = '', showDefaultApps = false } = {}) => {
     if (!message) {
       setGlobalNotice(null);
       return;
     }
-    setGlobalNotice({ message, hint });
+    setGlobalNotice({ message, hint, magnetFallback, showDefaultApps });
   }, []);
 
   const auth = useAuthController({
@@ -199,50 +206,90 @@ export default function App() {
     }
   }, []);
 
+  const refreshMagnetHandler = useCallback(async () => {
+    const info = await inspectMagnetHandler();
+    setMagnetHandler(info);
+  }, []);
+
   useEffect(() => {
     let active = true;
-    Promise.all([getAppInfo(), getDesktopSettings(), getUpdaterState(), geminiApi.getStatus()]).then(
-      ([info, loadedSettings, updaterState, geminiStatus]) => {
-        if (!active) return;
-        setAppInfo(info);
-        setSettings(loadedSettings);
-        setUpdater(updaterState);
-        setGeminiAvailable(Boolean(geminiStatus?.configured));
-        if (loadedSettings?.rankingPreference) {
-          setRankingPreference(normalizeRankingPreference(loadedSettings.rankingPreference));
-        }
-        if (loadedSettings?.audioPreference) {
-          setAudioPreference(loadedSettings.audioPreference);
-        }
-        if (loadedSettings?.resolutionPreference) {
-          setResolutionPreference(loadedSettings.resolutionPreference);
-        }
+    Promise.all([
+      getAppInfo(),
+      getDesktopSettings(),
+      getUpdaterState(),
+      geminiApi.getStatus(),
+      inspectMagnetHandler()
+    ]).then(([info, loadedSettings, updaterState, geminiStatus, handlerInfo]) => {
+      if (!active) return;
+      setAppInfo(info);
+      setSettings(loadedSettings);
+      setUpdater(updaterState);
+      setGeminiAvailable(Boolean(geminiStatus?.configured));
+      setMagnetHandler(handlerInfo);
+      if (loadedSettings?.defaultSearchMode) {
+        setMediaType(normalizeMediaType(loadedSettings.defaultSearchMode));
       }
-    );
+      if (loadedSettings?.rankingPreference) {
+        setRankingPreference(normalizeRankingPreference(loadedSettings.rankingPreference));
+      }
+      if (loadedSettings?.audioPreference) {
+        setAudioPreference(loadedSettings.audioPreference);
+      }
+      if (loadedSettings?.resolutionPreference) {
+        setResolutionPreference(loadedSettings.resolutionPreference);
+      }
+    });
 
     refreshHealth();
-    const unsubscribe = subscribeUpdaterStatus(nextState => {
+    const unsubscribeUpdater = subscribeUpdaterStatus(nextState => {
       setUpdater(nextState);
     });
+    const unsubscribeNav = subscribeDesktopNavigation(payload => {
+      if (payload?.tab) setActiveTab(payload.tab);
+      if (payload?.focusSearch) {
+        setTimeout(() => searchInputRef.current?.focus(), 40);
+      }
+    });
+
+    const handleOnline = () => {
+      setIsOnline(true);
+      refreshHealth();
+      showToast('Back online — reconnected to SeasonFetch');
+    };
+    const handleOffline = () => {
+      setIsOnline(false);
+    };
 
     const handleKeyDown = event => {
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') {
         event.preventDefault();
         setActiveTab('discover');
-        searchInputRef.current?.focus();
+        setTimeout(() => searchInputRef.current?.focus(), 20);
+      } else if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'l') {
+        event.preventDefault();
+        setActiveTab('library');
+      } else if ((event.ctrlKey || event.metaKey) && event.key === ',') {
+        event.preventDefault();
+        setActiveTab('settings');
       }
     };
+
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
     window.addEventListener('keydown', handleKeyDown);
 
     return () => {
       active = false;
-      unsubscribe();
+      unsubscribeUpdater();
+      unsubscribeNav();
       autocompleteCoordinator.invalidate();
       scanCoordinator.invalidate();
       if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
       window.removeEventListener('keydown', handleKeyDown);
     };
-  }, [autocompleteCoordinator, scanCoordinator, refreshHealth]);
+  }, [autocompleteCoordinator, scanCoordinator, refreshHealth, showToast]);
 
   const activeFiltersPayload = useMemo(() => {
     const filters = { resolution: resolutionPreference };
@@ -257,7 +304,7 @@ export default function App() {
     return filters;
   }, [resolutionPreference, minSeeders, maxSizeGb, codecFilter, hdrFilter]);
 
-  async function handleSettingsPatch(patch, { silent = false } = {}) {
+  const handleSettingsPatch = useCallback(async (patch, { silent = false } = {}) => {
     if (!silent) setSettingsNotice('');
     const result = await updateDesktopSettings(patch);
     if (result?.ok) {
@@ -269,7 +316,18 @@ export default function App() {
     } else if (!silent) {
       setSettingsNotice(result?.error || 'Could not save desktop preferences.');
     }
-  }
+  }, []);
+
+  const recordRecentSearch = useCallback((cleanQuery, mode) => {
+    const current = Array.isArray(settings?.recentSearches) ? settings.recentSearches : [];
+    const next = [
+      { query: cleanQuery, mediaType: normalizeMediaType(mode) },
+      ...current.filter(
+        entry => !(entry.mediaType === normalizeMediaType(mode) && entry.query.toLowerCase() === cleanQuery.toLowerCase())
+      )
+    ].slice(0, 10);
+    handleSettingsPatch({ recentSearches: next }, { silent: true });
+  }, [settings?.recentSearches, handleSettingsPatch]);
 
   function handleRankingChange(nextValue) {
     const normalized = normalizeRankingPreference(nextValue);
@@ -315,7 +373,11 @@ export default function App() {
     } else {
       showNotice(
         result?.error || 'Could not open magnet URI with your operating system.',
-        result?.hint || 'You can copy the magnet link and paste it into your download client.'
+        {
+          hint: result?.hint || 'Check Windows Default Apps or copy the magnet link manually.',
+          magnetFallback: magnet,
+          showDefaultApps: true
+        }
       );
     }
   }
@@ -327,6 +389,42 @@ export default function App() {
       showToast(successLabel);
     } catch (error) {
       showNotice(error.message || 'Unable to copy to clipboard.');
+    }
+  }
+
+  async function handleSaveSeasonMagnetsFile() {
+    if (!seasonMagnets.length) return;
+    const safeTitle = String(selectedItem?.title || 'season')
+      .replace(/[^a-z0-9]+/gi, '-')
+      .replace(/^-|-$/g, '')
+      .toLowerCase() || 'season';
+    const result = await saveTextFile({
+      title: `Save Season ${season} Magnets`,
+      defaultFilename: `${safeTitle}-season-${season}-magnets.txt`,
+      content: `${seasonMagnets.join('\n')}\n`
+    });
+    if (result?.ok) {
+      showToast(`Saved ${seasonMagnets.length} magnets to file`);
+    } else if (!result?.canceled && result?.error) {
+      showNotice(result.error);
+    }
+  }
+
+  async function handleExportDiagnostics() {
+    const report = await getDesktopDiagnostics();
+    if (!report) {
+      showNotice('Diagnostics export is only available inside the desktop application.');
+      return;
+    }
+    const result = await saveTextFile({
+      title: 'Export SeasonFetch Diagnostics Report',
+      defaultFilename: `seasonfetch-diagnostics-v${report.app?.version || '0.1.0'}.txt`,
+      content: `${JSON.stringify(report, null, 2)}\n`
+    });
+    if (result?.ok) {
+      showToast('Redacted diagnostics report saved');
+    } else if (!result?.canceled && result?.error) {
+      showNotice(result.error);
     }
   }
 
@@ -374,6 +472,7 @@ export default function App() {
 
     autocompleteCoordinator.invalidate();
     scanCoordinator.invalidate();
+    setMediaType(activeMode);
     setSuggestions([]);
     setSuggestionsLoading(false);
     setSelectedItem(null);
@@ -394,6 +493,7 @@ export default function App() {
       return;
     }
 
+    recordRecentSearch(clean, activeMode);
     const filtered = filterResultsByMediaType(response.data?.results, activeMode);
     setResults(filtered);
     setResolution(response.data?.resolution || null);
@@ -744,6 +844,8 @@ export default function App() {
     || auth.authenticatedUser?.email
     || 'Signed in';
 
+  const recentSearches = Array.isArray(settings?.recentSearches) ? settings.recentSearches : [];
+
   const navItems = [
     { id: 'discover', label: 'Discover', subtitle: 'Search & Release Engine' },
     {
@@ -842,22 +944,24 @@ export default function App() {
             )}
           </div>
 
-          <div className={`status-card status-${health.status}`}>
+          <div className={`status-card status-${!isOnline ? 'offline' : health.status}`}>
             <div className="status-card-row">
               <span className="status-dot" />
               <strong>
-                {health.status === 'online'
-                  ? 'Backend Connected'
-                  : health.status === 'checking'
-                    ? 'Checking Backend'
-                    : 'Backend Offline'}
+                {!isOnline
+                  ? 'Offline Mode'
+                  : health.status === 'online'
+                    ? 'Backend Connected'
+                    : health.status === 'checking'
+                      ? 'Checking Backend'
+                      : 'Backend Offline'}
               </strong>
             </div>
             <p className="mono-caption">
               {appInfo?.backendUrl || 'https://season-fetch.vercel.app'}
-              {health.status === 'online' && health.latencyMs ? ` · ${health.latencyMs}ms` : ''}
+              {isOnline && health.status === 'online' && health.latencyMs ? ` · ${health.latencyMs}ms` : ''}
             </p>
-            {health.status === 'offline' && (
+            {(health.status === 'offline' || !isOnline) && (
               <button type="button" className="inline-link" onClick={refreshHealth}>
                 Retry connection
               </button>
@@ -879,10 +983,19 @@ export default function App() {
       </aside>
 
       <div className="workspace-column">
+        {!isOnline && (
+          <div className="offline-banner" role="status">
+            <strong>You are currently offline.</strong> Search, Torrentio release scanning, and library syncing will resume automatically when your connection returns.
+          </div>
+        )}
+
         <UpdateBanner
           updater={updater}
           onInstallNow={installDownloadedUpdate}
           onPostpone={postponeUpdateInstall}
+          onRetryDownload={downloadAvailableUpdate}
+          onDismissRecovery={dismissUpdaterRecovery}
+          onOpenReleases={openExternalUrl}
           onOpenUpdates={() => setActiveTab('updates')}
         />
 
@@ -903,9 +1016,29 @@ export default function App() {
               <strong>{globalNotice.message}</strong>
               {globalNotice.hint && <p className="alert-hint">{globalNotice.hint}</p>}
             </div>
-            <button type="button" className="ghost-button small-button" onClick={() => setGlobalNotice(null)}>
-              Dismiss
-            </button>
+            <div className="update-banner-actions">
+              {globalNotice.magnetFallback && (
+                <button
+                  type="button"
+                  className="secondary-button small-button"
+                  onClick={() => handleCopyText(globalNotice.magnetFallback, 'Magnet link copied to clipboard')}
+                >
+                  Copy Magnet
+                </button>
+              )}
+              {globalNotice.showDefaultApps && (
+                <button
+                  type="button"
+                  className="secondary-button small-button"
+                  onClick={() => openExternalUrl('ms-settings:defaultapps')}
+                >
+                  Windows Default Apps
+                </button>
+              )}
+              <button type="button" className="ghost-button small-button" onClick={() => setGlobalNotice(null)}>
+                Dismiss
+              </button>
+            </div>
           </div>
         )}
 
@@ -980,10 +1113,36 @@ export default function App() {
                       Clear
                     </button>
                   )}
-                  <button type="submit" className="primary-button" disabled={searching}>
+                  <button type="submit" className="primary-button" disabled={searching || !isOnline}>
                     {searching ? 'Searching...' : 'Search'}
                   </button>
                 </form>
+
+                {!selectedItem && !query && recentSearches.length > 0 && (
+                  <div className="recent-bar">
+                    <span className="section-kicker">RECENT:</span>
+                    {recentSearches.map((entry, idx) => (
+                      <button
+                        key={`${entry.mediaType}:${entry.query}:${idx}`}
+                        type="button"
+                        className="recent-chip"
+                        onClick={() => {
+                          setQuery(entry.query);
+                          runFullSearch(entry.query, entry.mediaType);
+                        }}
+                      >
+                        {entry.query} <small>{entry.mediaType === 'movie' ? 'Movie' : 'Series'}</small>
+                      </button>
+                    ))}
+                    <button
+                      type="button"
+                      className="inline-link"
+                      onClick={() => handleSettingsPatch({ recentSearches: [] }, { silent: true })}
+                    >
+                      Clear
+                    </button>
+                  </div>
+                )}
 
                 {geminiQueries.length > 0 && (
                   <div className="gemini-chip-bar">
@@ -1172,7 +1331,7 @@ export default function App() {
                           <button
                             type="button"
                             className="primary-button"
-                            disabled={checkingSources || detailLoading}
+                            disabled={checkingSources || detailLoading || !isOnline}
                             onClick={() => scanMovieSources(selectedItem)}
                           >
                             {checkingSources ? 'Scanning...' : 'Check Movie Sources'}
@@ -1181,7 +1340,7 @@ export default function App() {
                           <button
                             type="button"
                             className="primary-button"
-                            disabled={checkingSources || detailLoading}
+                            disabled={checkingSources || detailLoading || !isOnline}
                             onClick={handleCheckSeasonSources}
                           >
                             {checkingSources ? 'Scanning...' : `Check Season ${season}`}
@@ -1273,13 +1432,22 @@ export default function App() {
                         </div>
 
                         {seasonMagnets.length > 0 && (
-                          <button
-                            type="button"
-                            className="secondary-button small-button"
-                            onClick={() => handleCopyText(seasonMagnets.join('\n'), `Copied ${seasonMagnets.length} season magnets`)}
-                          >
-                            Copy All Magnets ({seasonMagnets.length})
-                          </button>
+                          <div className="button-row">
+                            <button
+                              type="button"
+                              className="secondary-button small-button"
+                              onClick={() => handleCopyText(seasonMagnets.join('\n'), `Copied ${seasonMagnets.length} season magnets`)}
+                            >
+                              Copy All ({seasonMagnets.length})
+                            </button>
+                            <button
+                              type="button"
+                              className="ghost-button small-button"
+                              onClick={handleSaveSeasonMagnetsFile}
+                            >
+                              Save .txt
+                            </button>
+                          </div>
                         )}
                       </div>
 
@@ -1607,6 +1775,12 @@ export default function App() {
                   </span>
                 </div>
 
+                {updater?.recoveryRequired && (
+                  <div className="notice-box" style={{ marginTop: 14 }}>
+                    <strong>Recovery Notice:</strong> {updater.recoveryMessage || updater.message}
+                  </div>
+                )}
+
                 {updater?.status === 'downloading' && (
                   <div className="progress-block">
                     <div className="progress-track">
@@ -1645,13 +1819,14 @@ export default function App() {
                     Check for Updates
                   </button>
 
-                  {updater?.status === 'available' && (
+                  {(updater?.status === 'available' || updater?.status === 'error' || updater?.status === 'recovery')
+                    && updater?.errorCode !== 'SIGNATURE_VERIFICATION_FAILED' && (
                     <button
                       type="button"
                       className="secondary-button"
                       onClick={() => downloadAvailableUpdate()}
                     >
-                      Download v{updater.availableVersion}
+                      {updater?.status === 'available' ? `Download v${updater.availableVersion}` : 'Retry Download'}
                     </button>
                   )}
 
@@ -1672,6 +1847,16 @@ export default function App() {
                         Install on Quit
                       </button>
                     </>
+                  )}
+
+                  {updater?.recoveryRequired && (
+                    <button
+                      type="button"
+                      className="ghost-button"
+                      onClick={() => dismissUpdaterRecovery()}
+                    >
+                      Clear Recovery Notice
+                    </button>
                   )}
 
                   {updater?.releasesUrl && (
@@ -1730,6 +1915,31 @@ export default function App() {
 
                 <div className="setting-row">
                   <div>
+                    <strong>Default Catalog Tab</strong>
+                    <p className="muted-copy">
+                      Choose whether Discover opens in Series or Movies mode by default.
+                    </p>
+                  </div>
+                  <div className="search-mode">
+                    <button
+                      type="button"
+                      aria-pressed={(settings?.defaultSearchMode || 'series') === 'series'}
+                      onClick={() => handleSettingsPatch({ defaultSearchMode: 'series' })}
+                    >
+                      Series
+                    </button>
+                    <button
+                      type="button"
+                      aria-pressed={settings?.defaultSearchMode === 'movie'}
+                      onClick={() => handleSettingsPatch({ defaultSearchMode: 'movie' })}
+                    >
+                      Movies
+                    </button>
+                  </div>
+                </div>
+
+                <div className="setting-row">
+                  <div>
                     <strong>Check for updates automatically</strong>
                     <p className="muted-copy">
                       Check when SeasonFetch launches and every 4 hours while running.
@@ -1758,6 +1968,43 @@ export default function App() {
 
                 <div className="setting-row">
                   <div>
+                    <strong>Minimize to System Tray on close</strong>
+                    <p className="muted-copy">
+                      Keep SeasonFetch running quietly in the Windows taskbar tray when closing the window.
+                    </p>
+                  </div>
+                  <input
+                    type="checkbox"
+                    checked={Boolean(settings?.minimizeToTray ?? false)}
+                    onChange={event => handleSettingsPatch({ minimizeToTray: event.target.checked })}
+                  />
+                </div>
+
+                <div className="setting-row">
+                  <div>
+                    <strong>Windows Magnet Protocol Handler</strong>
+                    <p className="muted-copy">
+                      {magnetHandler?.registered
+                        ? `Detected (${magnetHandler.source}): ${magnetHandler.commandHint || magnetHandler.handlerName}`
+                        : magnetHandler?.guidance || 'Inspecting Windows magnet: registration...'}
+                    </p>
+                  </div>
+                  <div className="button-row">
+                    <button type="button" className="ghost-button small-button" onClick={refreshMagnetHandler}>
+                      Re-check
+                    </button>
+                    <button
+                      type="button"
+                      className="secondary-button small-button"
+                      onClick={() => openExternalUrl('ms-settings:defaultapps')}
+                    >
+                      Default Apps
+                    </button>
+                  </div>
+                </div>
+
+                <div className="setting-row">
+                  <div>
                     <strong>Session Vault Security</strong>
                     <p className="muted-copy">
                       Supabase session tokens are stored via Electron <code>safeStorage</code> (Windows DPAPI) and never written in plaintext.
@@ -1770,12 +2017,17 @@ export default function App() {
 
                 <div className="setting-row">
                   <div>
-                    <strong>Connected Backend</strong>
+                    <strong>Connected Backend &amp; Diagnostics</strong>
                     <p className="mono-caption">{settings?.backendUrl || appInfo?.backendUrl || 'https://season-fetch.vercel.app'}</p>
                   </div>
-                  <button type="button" className="secondary-button" onClick={refreshHealth}>
-                    Test Health
-                  </button>
+                  <div className="button-row">
+                    <button type="button" className="secondary-button small-button" onClick={refreshHealth}>
+                      Test Health
+                    </button>
+                    <button type="button" className="ghost-button small-button" onClick={handleExportDiagnostics}>
+                      Export Diagnostics
+                    </button>
+                  </div>
                 </div>
 
                 {settingsNotice && <div className="settings-toast">{settingsNotice}</div>}

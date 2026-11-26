@@ -1,4 +1,7 @@
 const MAGNET_HASH_PATTERN = /^urn:(?:btih:(?:[a-fA-F0-9]{40}|[a-zA-Z2-7]{32})|btmh:1220[a-fA-F0-9]{64})$/;
+const ALLOWED_WINDOWS_SETTINGS_URIS = new Set([
+  'ms-settings:defaultapps'
+]);
 
 function validateExternalTarget(rawUrl) {
   if (typeof rawUrl !== 'string' || !rawUrl.trim()) {
@@ -15,6 +18,14 @@ function validateExternalTarget(rawUrl) {
       ok: false,
       code: 'URL_TOO_LONG',
       error: 'External URL exceeds maximum allowed length.'
+    };
+  }
+
+  if (ALLOWED_WINDOWS_SETTINGS_URIS.has(trimmed.toLowerCase())) {
+    return {
+      ok: true,
+      protocol: 'ms-settings:',
+      url: trimmed.toLowerCase()
     };
   }
 
@@ -99,7 +110,7 @@ async function openExternalTarget(rawUrl, opener) {
       protocol: validated.protocol,
       error: isMagnet
         ? 'Windows could not open this magnet link with a registered download client.'
-        : 'Unable to open external link in your default browser.',
+        : 'Unable to open external link.',
       detail,
       hint: isMagnet
         ? 'Check Windows Default Apps for the magnet: protocol or enable magnet link association inside your download client (for example Free Download Manager, qBittorrent, or uTorrent), or copy the magnet link manually.'
@@ -109,6 +120,7 @@ async function openExternalTarget(rawUrl, opener) {
 }
 
 module.exports = {
+  ALLOWED_WINDOWS_SETTINGS_URIS,
   validateExternalTarget,
   openExternalTarget
 };

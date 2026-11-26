@@ -20,7 +20,8 @@ export async function getAppInfo() {
       electronVersion: null,
       isPackaged: false,
       backendUrl: 'https://season-fetch.vercel.app',
-      updateChannel: 'stable'
+      updateChannel: 'stable',
+      authVaultEncrypted: false
     };
   }
   return bridge.getAppInfo();
@@ -94,6 +95,34 @@ export async function openExternalUrl(url) {
   return bridge.openExternal(url);
 }
 
+export async function inspectMagnetHandler() {
+  const bridge = getDesktopBridge();
+  if (!bridge?.inspectMagnetHandler) {
+    return { supported: false, registered: false, guidance: 'Desktop runtime required.' };
+  }
+  return bridge.inspectMagnetHandler();
+}
+
+export async function saveTextFile({ title, defaultFilename, content }) {
+  const bridge = getDesktopBridge();
+  if (!bridge?.saveTextFile) {
+    return { ok: false, error: 'Native save dialog requires the desktop runtime.' };
+  }
+  return bridge.saveTextFile({ title, defaultFilename, content });
+}
+
+export async function getDesktopDiagnostics() {
+  const bridge = getDesktopBridge();
+  if (!bridge?.getDiagnostics) return null;
+  return bridge.getDiagnostics();
+}
+
+export function subscribeDesktopNavigation(callback) {
+  const bridge = getDesktopBridge();
+  if (!bridge?.onNavigate) return () => {};
+  return bridge.onNavigate(callback);
+}
+
 export async function getDesktopSettings() {
   const bridge = getDesktopBridge();
   if (!bridge) return null;
@@ -122,6 +151,12 @@ export async function downloadAvailableUpdate() {
   const bridge = getDesktopBridge();
   if (!bridge) return null;
   return bridge.updater.download();
+}
+
+export async function dismissUpdaterRecovery() {
+  const bridge = getDesktopBridge();
+  if (!bridge?.updater?.dismissRecovery) return null;
+  return bridge.updater.dismissRecovery();
 }
 
 export async function postponeUpdateInstall() {

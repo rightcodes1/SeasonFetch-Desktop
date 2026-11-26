@@ -4,6 +4,7 @@ const path = require('node:path');
 const DEFAULT_BACKEND_URL = 'https://season-fetch.vercel.app';
 const VALID_CHANNELS = new Set(['stable', 'preview']);
 const VALID_THEMES = new Set(['dark']);
+const VALID_SEARCH_MODES = new Set(['series', 'movie']);
 const VALID_RANKING_PREFERENCES = new Set([
   'best-overall',
   'smallest-acceptable',
@@ -23,6 +24,8 @@ const VALID_RESOLUTION_PREFERENCES = new Set([
   '2160p',
   'any'
 ]);
+const MAX_RECENT_SEARCHES = 12;
+
 const DEFAULT_BOUNDS = Object.freeze({
   width: 1240,
   height: 820,
@@ -35,11 +38,14 @@ const DEFAULT_SETTINGS = Object.freeze({
   updateChannel: 'stable',
   autoCheckUpdates: true,
   autoDownloadUpdates: true,
+  minimizeToTray: false,
   theme: 'dark',
+  defaultSearchMode: 'series',
   backendUrl: DEFAULT_BACKEND_URL,
   rankingPreference: 'smallest-acceptable',
   audioPreference: 'any',
   resolutionPreference: '1080p',
+  recentSearches: [],
   windowBounds: { ...DEFAULT_BOUNDS }
 });
 
@@ -87,6 +93,24 @@ function sanitizeWindowBounds(raw) {
   return { width, height, x, y, isMaximized };
 }
 
+function sanitizeRecentSearches(raw) {
+  if (!Array.isArray(raw)) return [];
+  const seen = new Set();
+  const clean = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== 'object') continue;
+    const query = typeof entry.query === 'string' ? entry.query.trim().slice(0, 120) : '';
+    const mediaType = VALID_SEARCH_MODES.has(entry.mediaType) ? entry.mediaType : 'series';
+    if (query.length < 2) continue;
+    const key = `${mediaType}:${query.toLowerCase()}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    clean.push({ query, mediaType });
+    if (clean.length >= MAX_RECENT_SEARCHES) break;
+  }
+  return clean;
+}
+
 function sanitizeSettings(raw, options = {}) {
   const input = raw && typeof raw === 'object' ? raw : {};
   const allowLocalhost = Boolean(options.allowLocalhost);
@@ -101,9 +125,15 @@ function sanitizeSettings(raw, options = {}) {
     autoDownloadUpdates: typeof input.autoDownloadUpdates === 'boolean'
       ? input.autoDownloadUpdates
       : DEFAULT_SETTINGS.autoDownloadUpdates,
+    minimizeToTray: typeof input.minimizeToTray === 'boolean'
+      ? input.minimizeToTray
+      : DEFAULT_SETTINGS.minimizeToTray,
     theme: VALID_THEMES.has(input.theme)
       ? input.theme
       : DEFAULT_SETTINGS.theme,
+    defaultSearchMode: VALID_SEARCH_MODES.has(input.defaultSearchMode)
+      ? input.defaultSearchMode
+      : DEFAULT_SETTINGS.defaultSearchMode,
     backendUrl: validateBackendUrl(input.backendUrl, { allowLocalhost }),
     rankingPreference: VALID_RANKING_PREFERENCES.has(input.rankingPreference)
       ? input.rankingPreference
@@ -114,7 +144,16 @@ function sanitizeSettings(raw, options = {}) {
     resolutionPreference: VALID_RESOLUTION_PREFERENCES.has(input.resolutionPreference)
       ? input.resolutionPreference
       : DEFAULT_SETTINGS.resolutionPreference,
+    recentSearches: sanitizeRecentSearches(input.recentSearches),
     windowBounds: sanitizeWindowBounds(input.windowBounds)
+  };
+}
+
+function cloneSettings(settings) {
+  return {
+    ...settings,
+    recentSearches: settings.recentSearches.map(item => ({ ...item })),
+    windowBounds: { ...settings.windowBounds }
   };
 }
 
@@ -137,7 +176,7 @@ function createSettingsStore({ filePath, allowLocalhost = false, envBackendUrl =
       merged.backendUrl = validateBackendUrl(envBackendUrl, { allowLocalhost });
     }
     cached = merged;
-    return { ...cached, windowBounds: { ...cached.windowBounds } };
+    return cloneSettings(cached);
   }
 
   function persist(nextSettings) {
@@ -150,7 +189,7 @@ function createSettingsStore({ filePath, allowLocalhost = false, envBackendUrl =
 
   function get() {
     if (!cached) return load();
-    return { ...cached, windowBounds: { ...cached.windowBounds } };
+    return cloneSettings(cached);
   }
 
   function update(patch = {}) {
@@ -169,13 +208,13 @@ function createSettingsStore({ filePath, allowLocalhost = false, envBackendUrl =
     } catch (error) {
       return {
         ok: false,
-        settings: { ...cached, windowBounds: { ...cached.windowBounds } },
+        settings: cloneSettings(cached),
         error: error instanceof Error ? error.message : 'Failed to save settings.'
       };
     }
     return {
       ok: true,
-      settings: { ...cached, windowBounds: { ...cached.windowBounds } }
+      settings: cloneSettings(cached)
     };
   }
 
@@ -192,6 +231,7 @@ module.exports = {
   DEFAULT_BOUNDS,
   validateBackendUrl,
   sanitizeWindowBounds,
+  sanitizeRecentSearches,
   sanitizeSettings,
   createSettingsStore
 };

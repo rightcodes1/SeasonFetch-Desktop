@@ -1,3 +1,6 @@
+const fs = require('node:fs');
+const path = require('node:path');
+
 const DEFAULT_CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000;
 const INITIAL_CHECK_DELAY_MS = 5_000;
 const RELEASES_FALLBACK_URL = 'https://github.com/rightcodes1/SeasonFetch-Desktop/releases';
@@ -37,11 +40,11 @@ function classifyUpdaterError(error) {
     };
   }
 
-  if (lower.includes('signature') || lower.includes('sha512') || lower.includes('checksum')) {
+  if (lower.includes('signature') || lower.includes('sha512') || lower.includes('checksum') || lower.includes('verify')) {
     return {
       code: 'SIGNATURE_VERIFICATION_FAILED',
-      message: 'Update package verification failed. Installation was aborted for your safety.',
-      recoverable: true
+      message: 'Update package signature verification failed. Installation was aborted for your safety.',
+      recoverable: false
     };
   }
 
@@ -53,11 +56,42 @@ function classifyUpdaterError(error) {
     };
   }
 
+  if (lower.includes('cancelled') || lower.includes('aborted')) {
+    return {
+      code: 'DOWNLOAD_INTERRUPTED',
+      message: 'Update download was interrupted. You can safely retry the download.',
+      recoverable: true
+    };
+  }
+
   return {
     code: 'UPDATE_FAILED',
     message: 'Automatic update did not complete cleanly. You can retry or download the latest installer directly.',
     recoverable: true
   };
+}
+
+function readUpdaterPersistence(stateFilePath) {
+  if (!stateFilePath) return {};
+  try {
+    if (!fs.existsSync(stateFilePath)) return {};
+    const parsed = JSON.parse(fs.readFileSync(stateFilePath, 'utf8'));
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeUpdaterPersistence(stateFilePath, data) {
+  if (!stateFilePath) return;
+  try {
+    fs.mkdirSync(path.dirname(stateFilePath), { recursive: true });
+    const tmp = `${stateFilePath}.tmp`;
+    fs.writeFileSync(tmp, `${JSON.stringify(data, null, 2)}\n`, 'utf8');
+    fs.renameSync(tmp, stateFilePath);
+  } catch {
+    // Non-fatal persistence error
+  }
 }
 
 function createUpdaterController({
@@ -67,6 +101,8 @@ function createUpdaterController({
   autoCheckUpdates = true,
   autoDownloadUpdates = true,
   autoUpdater = null,
+  stateFilePath = null,
+  logger = null,
   checkIntervalMs = DEFAULT_CHECK_INTERVAL_MS,
   initialDelayMs = INITIAL_CHECK_DELAY_MS,
   onStateChange = () => {}
@@ -76,10 +112,28 @@ function createUpdaterController({
   let startupTimer = null;
   let isChecking = false;
 
+  const persisted = readUpdaterPersistence(stateFilePath);
+  const unfinishedInstallVersion = persisted.pendingInstallVersion && persisted.pendingInstallVersion !== appVersion
+    ? String(persisted.pendingInstallVersion)
+    : null;
+
+  if (persisted.pendingInstallVersion && persisted.pendingInstallVersion === appVersion) {
+    writeUpdaterPersistence(stateFilePath, {
+      lastSuccessfulVersion: appVersion,
+      pendingInstallVersion: null,
+      installRequestedAt: null,
+      updatedAt: new Date().toISOString()
+    });
+  }
+
   let state = {
-    status: isPackaged ? 'idle' : 'dev-mode',
+    status: unfinishedInstallVersion
+      ? 'recovery'
+      : isPackaged
+        ? 'idle'
+        : 'dev-mode',
     currentVersion: appVersion,
-    availableVersion: null,
+    availableVersion: unfinishedInstallVersion || null,
     releaseName: null,
     releaseNotes: null,
     channel: channelConfig.channel,
@@ -91,11 +145,17 @@ function createUpdaterController({
     totalBytes: 0,
     postponed: false,
     retryCount: 0,
+    recoveryRequired: Boolean(unfinishedInstallVersion),
+    recoveryMessage: unfinishedInstallVersion
+      ? `Previous update to v${unfinishedInstallVersion} did not complete. Retry the update or download the Windows installer manually from GitHub Releases.`
+      : null,
     lastCheckedAt: null,
     errorCode: null,
-    message: isPackaged
-      ? 'Ready to check for updates.'
-      : 'Running in unpackaged development mode. Automatic updates activate in packaged Windows builds.',
+    message: unfinishedInstallVersion
+      ? `Update recovery needed for v${unfinishedInstallVersion}.`
+      : isPackaged
+        ? 'Ready to check for updates.'
+        : 'Running in unpackaged development mode. Automatic updates activate in packaged Windows builds.',
     releasesUrl: RELEASES_FALLBACK_URL
   };
 
@@ -123,6 +183,7 @@ function createUpdaterController({
 
     autoUpdater.on('checking-for-update', () => {
       isChecking = true;
+      logger?.info('updater', `Checking ${channelConfig.channel} channel for updates`);
       emit({
         status: 'checking',
         errorCode: null,
@@ -132,6 +193,7 @@ function createUpdaterController({
 
     autoUpdater.on('update-available', info => {
       isChecking = false;
+      logger?.info('updater', 'Update available', { version: info?.version, channel: channelConfig.channel });
       emit({
         status: 'available',
         availableVersion: info?.version || null,
@@ -140,6 +202,8 @@ function createUpdaterController({
         lastCheckedAt: new Date().toISOString(),
         errorCode: null,
         postponed: false,
+        recoveryRequired: false,
+        recoveryMessage: null,
         message: state.autoDownloadUpdates
           ? `Version ${info?.version || 'new'} found. Downloading in the background...`
           : `Version ${info?.version || 'new'} is available to download.`
@@ -148,6 +212,7 @@ function createUpdaterController({
 
     autoUpdater.on('update-not-available', () => {
       isChecking = false;
+      logger?.info('updater', 'Application is up to date', { version: appVersion, channel: channelConfig.channel });
       emit({
         status: 'not-available',
         availableVersion: null,
@@ -173,24 +238,33 @@ function createUpdaterController({
 
     autoUpdater.on('update-downloaded', info => {
       isChecking = false;
+      const version = info?.version || state.availableVersion;
+      logger?.info('updater', 'Update downloaded and verified', { version });
       emit({
         status: 'downloaded',
-        availableVersion: info?.version || state.availableVersion,
+        availableVersion: version,
         progressPercent: 100,
         retryCount: 0,
+        recoveryRequired: false,
+        recoveryMessage: null,
         errorCode: null,
-        message: `Version ${info?.version || state.availableVersion || 'new'} is verified and ready to install.`
+        message: `Version ${version || 'new'} is verified and ready to install.`
       });
     });
 
     autoUpdater.on('error', error => {
       isChecking = false;
       const classified = classifyUpdaterError(error);
+      logger?.error('updater', classified.code, error instanceof Error ? error.message : String(error));
       emit({
         status: 'error',
         retryCount: state.retryCount + 1,
         lastCheckedAt: new Date().toISOString(),
         errorCode: classified.code,
+        recoveryRequired: !classified.recoverable || state.retryCount + 1 >= 2,
+        recoveryMessage: !classified.recoverable
+          ? 'Automatic verification failed. Download a fresh signed installer from GitHub Releases.'
+          : null,
         message: classified.message
       });
     });
@@ -250,6 +324,7 @@ function createUpdaterController({
     } catch (error) {
       isChecking = false;
       const classified = classifyUpdaterError(error);
+      logger?.error('updater', `checkForUpdates failed: ${classified.code}`);
       return emit({
         status: 'error',
         retryCount: state.retryCount + 1,
@@ -264,13 +339,18 @@ function createUpdaterController({
     if (!isPackaged || !autoUpdater) {
       return getState();
     }
-    if (state.status !== 'available' && state.status !== 'error') {
+    if (state.errorCode === 'SIGNATURE_VERIFICATION_FAILED') {
+      return getState();
+    }
+    if (state.status !== 'available' && state.status !== 'error' && state.status !== 'recovery') {
       return getState();
     }
     emit({
       status: 'downloading',
       progressPercent: 0,
       errorCode: null,
+      recoveryRequired: false,
+      recoveryMessage: null,
       message: 'Starting update download...'
     });
     try {
@@ -278,13 +358,31 @@ function createUpdaterController({
       return getState();
     } catch (error) {
       const classified = classifyUpdaterError(error);
+      logger?.error('updater', `downloadUpdate failed: ${classified.code}`);
       return emit({
         status: 'error',
         retryCount: state.retryCount + 1,
         errorCode: classified.code,
+        recoveryRequired: !classified.recoverable || state.retryCount + 1 >= 2,
         message: classified.message
       });
     }
+  }
+
+  function dismissRecovery() {
+    writeUpdaterPersistence(stateFilePath, {
+      lastSuccessfulVersion: appVersion,
+      pendingInstallVersion: null,
+      installRequestedAt: null,
+      updatedAt: new Date().toISOString()
+    });
+    return emit({
+      status: isPackaged ? 'idle' : 'dev-mode',
+      recoveryRequired: false,
+      recoveryMessage: null,
+      errorCode: null,
+      message: isPackaged ? 'Recovery cleared. Ready to check for updates.' : 'Running in development mode.'
+    });
   }
 
   function postponeInstall() {
@@ -292,6 +390,12 @@ function createUpdaterController({
     if (autoUpdater && isPackaged) {
       autoUpdater.autoInstallOnAppQuit = true;
     }
+    writeUpdaterPersistence(stateFilePath, {
+      lastSuccessfulVersion: appVersion,
+      pendingInstallVersion: state.availableVersion,
+      installRequestedAt: new Date().toISOString(),
+      mode: 'on-quit'
+    });
     return emit({
       postponed: true,
       message: `Update v${state.availableVersion || ''} postponed. It will install automatically when you close SeasonFetch.`
@@ -305,18 +409,28 @@ function createUpdaterController({
         error: 'No verified update package is ready to install yet.'
       };
     }
+    writeUpdaterPersistence(stateFilePath, {
+      lastSuccessfulVersion: appVersion,
+      pendingInstallVersion: state.availableVersion,
+      installRequestedAt: new Date().toISOString(),
+      mode: 'immediate'
+    });
+    logger?.info('updater', 'Triggering quitAndInstall', { version: state.availableVersion });
     autoUpdater.quitAndInstall(false, true);
     return { ok: true };
   }
 
   function updatePreferences({ channel: nextChannel, autoCheckUpdates: nextAutoCheck, autoDownloadUpdates: nextAutoDownload }) {
+    const previousChannel = channelConfig.channel;
     if (nextChannel !== undefined) {
       channelConfig = resolveChannelConfig(nextChannel);
     }
+    const channelChanged = previousChannel !== channelConfig.channel;
     const nextPatch = {
       channel: channelConfig.channel,
       autoCheckUpdates: nextAutoCheck !== undefined ? Boolean(nextAutoCheck) : state.autoCheckUpdates,
-      autoDownloadUpdates: nextAutoDownload !== undefined ? Boolean(nextAutoDownload) : state.autoDownloadUpdates
+      autoDownloadUpdates: nextAutoDownload !== undefined ? Boolean(nextAutoDownload) : state.autoDownloadUpdates,
+      ...(channelChanged ? { availableVersion: null, progressPercent: 0, postponed: false } : {})
     };
     emit(nextPatch);
     applyAutoUpdaterSettings();
@@ -340,6 +454,7 @@ function createUpdaterController({
     getState,
     checkForUpdates,
     downloadUpdate,
+    dismissRecovery,
     postponeInstall,
     installNow,
     updatePreferences

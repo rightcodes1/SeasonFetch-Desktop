@@ -34,6 +34,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Release preflight verification
+        run: node scripts/release-check.mjs
+
       - name: Run desktop unit tests
         run: npm test
 
@@ -59,7 +62,7 @@ jobs:
             echo "is_prerelease=false" >> $env:GITHUB_OUTPUT
           }
 
-      - name: Build Windows installer and updater artifacts
+      - name: Build Windows NSIS installer and updater metadata
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -72,6 +75,15 @@ jobs:
             npx electron-builder --win nsis --publish never -c.generateUpdatesFilesForAllChannels=true
           }
 
+      - name: Generate SHA-256 checksums
+        shell: pwsh
+        run: |
+          Get-ChildItem release\*.exe, release\*.blockmap, release\*.yml -ErrorAction SilentlyContinue |
+            ForEach-Object {
+              $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+              "$hash  $($_.Name)"
+            } | Set-Content -Path release\SHA256SUMS.txt -Encoding UTF8
+
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -80,4 +92,5 @@ jobs:
             release/*.exe
             release/*.blockmap
             release/*.yml
+            release/SHA256SUMS.txt
           retention-days: 14

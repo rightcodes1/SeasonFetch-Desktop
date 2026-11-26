@@ -14,6 +14,7 @@ const ALLOWED_REQUEST_HEADERS = new Set([
   'authorization',
   'x-client-info'
 ]);
+const TRANSIENT_RETRY_STATUSES = new Set([502, 503, 504]);
 const DEFAULT_TIMEOUT_MS = 15_000;
 const MAX_TIMEOUT_MS = 30_000;
 
@@ -111,19 +112,7 @@ function validateApiRequest(request, { backendOrigin }) {
   };
 }
 
-async function executeApiRequest(request, { backendOrigin, fetchImpl = globalThis.fetch }) {
-  const validated = validateApiRequest(request, { backendOrigin });
-  if (!validated.ok) {
-    return {
-      ok: false,
-      status: 0,
-      statusText: '',
-      code: validated.code,
-      error: validated.error,
-      data: null
-    };
-  }
-
+async function performSingleFetch(validated, fetchImpl) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), validated.timeoutMs);
 
@@ -154,7 +143,8 @@ async function executeApiRequest(request, { backendOrigin, fetchImpl = globalThi
         statusText: response.statusText || '',
         code: `HTTP_${response.status}`,
         error: message,
-        data
+        data,
+        retryable: TRANSIENT_RETRY_STATUSES.has(response.status)
       };
     }
 
@@ -164,7 +154,8 @@ async function executeApiRequest(request, { backendOrigin, fetchImpl = globalThi
       statusText: response.statusText || 'OK',
       code: 'OK',
       error: null,
-      data
+      data,
+      retryable: false
     };
   } catch (error) {
     const isTimeout = error && (error.name === 'AbortError' || error.code === 'ABORT_ERR');
@@ -176,11 +167,39 @@ async function executeApiRequest(request, { backendOrigin, fetchImpl = globalThi
       error: isTimeout
         ? `SeasonFetch backend timed out after ${Math.round(validated.timeoutMs / 1000)}s.`
         : 'Unable to reach the SeasonFetch backend. Check your internet connection and retry.',
-      data: null
+      data: null,
+      retryable: !isTimeout
     };
   } finally {
     clearTimeout(timer);
   }
+}
+
+async function executeApiRequest(request, { backendOrigin, fetchImpl = globalThis.fetch, retryDelayMs = 350 }) {
+  const validated = validateApiRequest(request, { backendOrigin });
+  if (!validated.ok) {
+    return {
+      ok: false,
+      status: 0,
+      statusText: '',
+      code: validated.code,
+      error: validated.error,
+      data: null
+    };
+  }
+
+  let result = await performSingleFetch(validated, fetchImpl);
+
+  // Only retry idempotent GET requests once on transient network or 502/503/504 errors.
+  if (!result.ok && result.retryable && validated.method === 'GET' && retryDelayMs >= 0) {
+    if (retryDelayMs > 0) {
+      await new Promise(resolve => setTimeout(resolve, retryDelayMs));
+    }
+    result = await performSingleFetch(validated, fetchImpl);
+  }
+
+  const { retryable: _omit, ...cleanResult } = result;
+  return cleanResult;
 }
 
 module.exports = {

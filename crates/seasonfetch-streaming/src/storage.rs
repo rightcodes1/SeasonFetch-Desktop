@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 pub const SPARSE_CHUNK_SIZE: u64 = 2 * 1024 * 1024; // 2 MiB per chunk file
-const MAX_OPEN_HANDLES: usize = 32;
+const MAX_OPEN_HANDLES: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct ChunkKey {
@@ -77,9 +77,12 @@ impl HandlePool {
             if create {
                 let _ = std::fs::create_dir_all(&self.root);
             }
+            // Always open with read+write so a handle cached by `pread_exact`
+            // (after LRU eviction) never causes `Access is denied (os error 5)`
+            // when `pwrite_all` later writes another block into the same 2 MiB chunk.
             let file = OpenOptions::new()
                 .read(true)
-                .write(create)
+                .write(true)
                 .create(create)
                 .open(&path)
                 .with_context(|| format!("failed to open sparse chunk {}", path.display()))?;
@@ -335,6 +338,44 @@ mod tests {
             total_disk <= 4 * 1024 * 1024,
             "expected <= 4 MiB on disk for 6.37 GB tail write, got {total_disk} bytes"
         );
+
+        storage.close_all_handles();
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn pread_after_lru_eviction_does_not_block_subsequent_pwrite() {
+        let tmp = std::env::temp_dir().join(format!(
+            "sf-sparse-evict-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let storage = SparseChunkStorage::new(tmp.clone());
+
+        // Write first block into chunk 0
+        storage.pwrite_all(4, 0, &[0xAA; 16384]).unwrap();
+
+        // Evict chunk 0 from the open-handle LRU cache by touching > MAX_OPEN_HANDLES other chunks
+        for c in 1..=(MAX_OPEN_HANDLES as u64 + 6) {
+            storage
+                .pwrite_all(4, c * SPARSE_CHUNK_SIZE, &[0x55; 64])
+                .unwrap();
+        }
+
+        // Re-open chunk 0 via pread_exact, then immediately write another block into chunk 0.
+        // Previously this failed on Windows with `Access is denied (os error 5)` because
+        // pread_exact cached a read-only handle!
+        let mut buf = [0u8; 16384];
+        storage.pread_exact(4, 0, &mut buf).unwrap();
+        assert_eq!(buf[0], 0xAA);
+        storage.pwrite_all(4, 16384, &[0xBB; 16384]).unwrap();
+
+        let mut verify = [0u8; 16384];
+        storage.pread_exact(4, 16384, &mut verify).unwrap();
+        assert_eq!(verify[0], 0xBB);
 
         storage.close_all_handles();
         std::fs::remove_dir_all(&tmp).unwrap();

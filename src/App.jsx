@@ -20,9 +20,11 @@ import {
   getUpdaterState,
   inspectMagnetHandler,
   installDownloadedUpdate,
+  launchCustomExternalPlayer,
   launchNativeMpv,
   listPlaybackProgress,
   openExternalUrl,
+  pickExternalPlayerExe,
   pickLocalMediaFile,
   postponeUpdateInstall,
   recordActivity,
@@ -341,10 +343,16 @@ export default function App() {
       }
       if (payload?.diagMagnet?.magnetUri) {
         const dm = payload.diagMagnet;
+        if (dm.engine) {
+          setSettings(prev => {
+            if (!prev) return prev;
+            return { ...prev, player: { ...(prev.player || {}), preferredEngine: dm.engine } };
+          });
+        }
         setPlayerSession({
           mediaKey: `diag-magnet:${dm.title || 'stream'}`,
           title: dm.title || 'Diagnostic Torrent Stream',
-          subtitle: 'SeasonFetch Embedded Torrent Engine',
+          subtitle: dm.engine ? `SeasonFetch Embedded Torrent Engine (${dm.engine})` : 'SeasonFetch Embedded Torrent Engine',
           streamUrl: null,
           rawPath: null,
           magnetUri: dm.magnetUri,
@@ -801,6 +809,21 @@ export default function App() {
     const mediaKey = `file:${picked.name}`;
     const existing = await getPlaybackProgress(mediaKey);
 
+    if (settings?.player?.preferredEngine === 'external-player') {
+      const extRes = await launchCustomExternalPlayer({
+        target: picked.path,
+        title: picked.name,
+        startSecs: existing?.positionSecs || 0,
+        executablePath: settings?.player?.externalPlayerPath || null
+      });
+      if (extRes?.ok) {
+        showToast(`Playing ${picked.name} in ${extRes.engine}`);
+        logActivity({ kind: 'playback', title: picked.name, subtitle: `Launched in ${extRes.engine}` });
+        return;
+      }
+      showNotice(extRes?.error || 'Could not launch external player; falling back to built-in player.');
+    }
+
     if (settings?.player?.preferredEngine === 'mpv' && playerBackend?.mpvAvailable) {
       const mpvRes = await launchNativeMpv({
         target: picked.path,
@@ -886,6 +909,21 @@ export default function App() {
     if (!resolved.streamUrl) {
       setPlaybackModalResolution(resolved);
       return;
+    }
+
+    if (settings?.player?.preferredEngine === 'external-player') {
+      const extRes = await launchCustomExternalPlayer({
+        target: resolved.streamUrl,
+        title: label,
+        startSecs: existing?.positionSecs || 0,
+        executablePath: settings?.player?.externalPlayerPath || null
+      });
+      if (extRes?.ok) {
+        showToast(`Playing ${label} in ${extRes.engine}`);
+        logActivity({ kind: 'playback', title: label, subtitle: `Launched in ${extRes.engine}` });
+        return;
+      }
+      showNotice(extRes?.error || 'Could not launch external player; falling back to built-in player.');
     }
 
     if (settings?.player?.preferredEngine === 'mpv' && playerBackend?.mpvAvailable) {
@@ -1309,6 +1347,18 @@ export default function App() {
                 onRefreshPlayerStatus={() => {
                   refreshPlayerStatus();
                   showToast('Re-probed player & streaming status');
+                }}
+                onPickExternalPlayer={async () => {
+                  const picked = await pickExternalPlayerExe();
+                  if (!picked?.ok || !picked.path) return;
+                  await handleSettingsPatch({
+                    player: {
+                      ...(settings?.player || {}),
+                      externalPlayerPath: picked.path,
+                      preferredEngine: 'external-player'
+                    }
+                  });
+                  showToast(`External player set to ${picked.name}`);
                 }}
                 onClearCache={async () => {
                   await clearLocalCache();

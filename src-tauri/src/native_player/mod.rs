@@ -130,7 +130,7 @@ impl NativePlaybackManager {
             inner.libvlc_dll.is_some(),
         );
 
-        if chosen == "webview" || chosen == "external-mpv" {
+        if chosen == "webview" || chosen == "external-mpv" || chosen == "external-player" {
             return NativeEngineActionResult {
                 ok: false,
                 engine: chosen.to_string(),
@@ -181,10 +181,14 @@ impl NativePlaybackManager {
 
         match chosen {
             "embedded-libmpv" => {
-                // Reuse existing libmpv instance if already active, otherwise drop other backend & spawn
+                // Reuse existing libmpv instance if already active; if switching away from another
+                // backend (e.g. libVLC), detach and drop it on a background thread so mutex never stalls.
                 let need_spawn = !matches!(inner.backend, ActiveBackend::LibMpv(_));
                 if need_spawn {
-                    inner.backend = ActiveBackend::None;
+                    let prev = std::mem::replace(&mut inner.backend, ActiveBackend::None);
+                    if !matches!(prev, ActiveBackend::None) {
+                        std::thread::spawn(move || drop(prev));
+                    }
                     let Some(dll) = inner.libmpv_dll.clone() else {
                         return NativeEngineActionResult {
                             ok: false,
@@ -241,7 +245,10 @@ impl NativePlaybackManager {
             "embedded-libvlc" => {
                 let need_spawn = !matches!(inner.backend, ActiveBackend::LibVlc(_));
                 if need_spawn {
-                    inner.backend = ActiveBackend::None;
+                    let prev = std::mem::replace(&mut inner.backend, ActiveBackend::None);
+                    if !matches!(prev, ActiveBackend::None) {
+                        std::thread::spawn(move || drop(prev));
+                    }
                     let Some(dll) = inner.libvlc_dll.clone() else {
                         return NativeEngineActionResult {
                             ok: false,

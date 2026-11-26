@@ -34,6 +34,7 @@ use tokio::task::JoinHandle;
 use url::Url;
 
 pub type StatusCallback = Arc<dyn Fn(StreamSessionStatus) + Send + Sync + 'static>;
+pub type LogCallback = Arc<dyn Fn(&str) + Send + Sync + 'static>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -74,6 +75,8 @@ struct EngineInner {
     session_counter: AtomicU64,
     /// Shared sparse chunked storage factory (allows instant handle release on close).
     storage_factory: SparseChunkStorageFactory,
+    /// Optional structured log sink (wired to desktop.log on desktop).
+    log_cb: RwLock<Option<LogCallback>>,
     /// Lazily initialized shared `librqbit` session (keeps DHT warm across episodes).
     rqbit_session: Mutex<Option<Arc<Session>>>,
     /// Currently active streaming torrent (single active playback session at a time).
@@ -119,6 +122,7 @@ impl TorrentStreamingEngine {
             local_origin,
             session_counter: AtomicU64::new(1),
             storage_factory: SparseChunkStorageFactory::new(cache_root),
+            log_cb: RwLock::new(None),
             rqbit_session: Mutex::new(None),
             active: RwLock::new(None),
             status: RwLock::new(StreamSessionStatus::idle()),
@@ -148,6 +152,18 @@ impl TorrentStreamingEngine {
         self.inner
             .cache_max_bytes
             .store(clamped * 1024 * 1024, Ordering::Relaxed);
+    }
+
+    pub async fn set_log_callback(&self, cb: LogCallback) {
+        *self.inner.log_cb.write().await = Some(cb);
+    }
+
+    pub(crate) fn log_event(&self, message: &str) {
+        if let Ok(guard) = self.inner.log_cb.try_read() {
+            if let Some(cb) = guard.as_ref() {
+                cb(message);
+            }
+        }
     }
 
     pub async fn current_status(&self) -> StreamSessionStatus {
@@ -278,6 +294,7 @@ impl TorrentStreamingEngine {
         let add_opts = AddTorrentOptions {
             overwrite: true,
             trackers: Some(trackers),
+            only_files: request.file_idx.map(|i| vec![i]),
             output_folder: Some(session_dir.to_string_lossy().to_string()),
             ..Default::default()
         };
@@ -383,15 +400,21 @@ impl TorrentStreamingEngine {
             .cloned()
             .unwrap_or((selected_idx, "stream.mkv".to_string(), 0));
 
-        // Restrict download exclusively to the selected episode/movie file (crucial for season packs!)
-        if files.len() > 1 {
+        // Restrict download exclusively to the selected episode/movie file (crucial for season packs!).
+        // If `file_idx` was already supplied in `AddTorrentOptions::only_files`, only re-apply when
+        // auto-selection chose a different index.
+        if files.len() > 1 && request.file_idx != Some(selected_idx) {
             let mut only = HashSet::new();
             only.insert(selected_idx);
-            let _ = rqbit.update_only_files(&handle, &only).await;
+            if let Err(err) = rqbit.update_only_files(&handle, &only).await {
+                self.log_event(&format!(
+                    "update_only_files(fileIdx={selected_idx}) warning: {err:#}"
+                ));
+            }
         }
 
         // Wait briefly for the torrent to enter `Live` state so `handle.stream(selected_idx)` is
-        // guaranteed to succeed the moment `libmpv` opens the local HTTP URL.
+        // guaranteed to succeed the moment the player opens the local HTTP URL.
         let live_deadline = Instant::now() + Duration::from_secs(6);
         while Instant::now() < live_deadline {
             if handle.clone().stream(selected_idx).is_ok() {
@@ -399,6 +422,19 @@ impl TorrentStreamingEngine {
             }
             tokio::time::sleep(Duration::from_millis(120)).await;
         }
+
+        let piece_len = handle
+            .metadata
+            .load_full()
+            .map(|m| m.lengths.default_piece_length() as u64)
+            .unwrap_or(0);
+        self.log_event(&format!(
+            "Torrent live: session={session_id} files={} selected_idx={selected_idx} file='{}' size={} piece_len={}",
+            files.len(),
+            file_name,
+            file_len,
+            piece_len
+        ));
 
         let safe_filename = sanitize_url_filename(&file_name);
         let stream_url = format!(
@@ -467,16 +503,31 @@ impl TorrentStreamingEngine {
                     let stats = handle_clone.stats();
                     let (peers_live, peers_seen) = extract_peer_counts(&stats);
                     let (dl_bps, ul_bps) = extract_speeds_bps(&stats);
-                    let file_downloaded =
+                    let verified_file_bytes =
                         stats.file_progress.get(selected_idx).copied().unwrap_or(0);
+                    let in_flight_bytes = extract_fetched_bytes(&stats);
+                    // Report verified file bytes once pieces finish, or bounded in-flight bytes
+                    // while the first large (e.g. 8 MiB) piece is still completing SHA-1 check
+                    // so the HUD never looks frozen at 0.0% during active peer transfers.
+                    let effective_downloaded = if verified_file_bytes > 0 {
+                        verified_file_bytes.min(file_len)
+                    } else {
+                        let piece_cap = handle_clone
+                            .metadata
+                            .load_full()
+                            .map(|m| (m.lengths.default_piece_length() as u64).saturating_mul(2))
+                            .unwrap_or(8 * 1024 * 1024)
+                            .min(file_len.saturating_div(4).max(1));
+                        in_flight_bytes.min(piece_cap)
+                    };
                     let pct = if file_len > 0 {
-                        ((file_downloaded as f64 / file_len as f64) * 100.0).clamp(0.0, 100.0)
+                        ((effective_downloaded as f64 / file_len as f64) * 100.0).clamp(0.0, 100.0)
                     } else {
                         0.0
                     };
                     let http_clients = active_http_clone.load(Ordering::Relaxed);
 
-                    let state = if http_clients > 0 && file_downloaded >= 256 * 1024 {
+                    let state = if http_clients > 0 && verified_file_bytes >= 256 * 1024 {
                         StreamSessionState::Streaming
                     } else {
                         StreamSessionState::Buffering
@@ -485,6 +536,12 @@ impl TorrentStreamingEngine {
                     let status_message = match state {
                         StreamSessionState::Streaming => format!(
                             "Streaming · {} peers · {}/s",
+                            peers_live,
+                            format_bytes_compact(dl_bps)
+                        ),
+                        _ if verified_file_bytes == 0 && in_flight_bytes > 0 => format!(
+                            "Buffering opening video piece ({} received) · {} peers · {}/s",
+                            format_bytes_compact(in_flight_bytes),
                             peers_live,
                             format_bytes_compact(dl_bps)
                         ),
@@ -507,7 +564,7 @@ impl TorrentStreamingEngine {
                         peers_seen,
                         download_speed_bps: dl_bps,
                         upload_speed_bps: ul_bps,
-                        downloaded_bytes: file_downloaded,
+                        downloaded_bytes: effective_downloaded,
                         total_bytes: file_len,
                         progress_percent: pct,
                         active_http_streams: http_clients,
@@ -525,26 +582,47 @@ impl TorrentStreamingEngine {
 
         let (cancel_tx, _) = watch::channel(false);
 
-        // Pre-warm the container tail (last ~1 MiB where MKV Cues / MP4 moov atom often live)
-        // in parallel with head startup so `libmpv` opens and seeks without stalling.
-        let prewarm_task = if file_len > 2 * 1024 * 1024 {
-            let handle_tail = Arc::clone(&handle);
-            let mut cancel_tail = cancel_tx.subscribe();
-            let tail_offset = file_len.saturating_sub(1024 * 1024);
+        // Head-first prioritization, THEN tail pre-warm:
+        // 1. Immediately register a stream at byte 0 so `librqbit` concentrates peer requests on
+        //    the very first piece of the selected file (never starving byte 0 behind the tail).
+        // 2. Only after the opening bytes at offset 0 are readable, briefly pre-warm the container
+        //    tail (last ~1 MiB where MKV Cues / MP4 moov often live) so seeking is instant too.
+        let prewarm_task = {
+            let handle_pw = Arc::clone(&handle);
+            let mut cancel_pw = cancel_tx.subscribe();
+            let tail_offset = if file_len > 2 * 1024 * 1024 {
+                Some(file_len.saturating_sub(64 * 1024))
+            } else {
+                None
+            };
             Some(tokio::spawn(async move {
                 use tokio::io::{AsyncReadExt, AsyncSeekExt};
-                if let Ok(mut s) = handle_tail.stream(selected_idx) {
-                    if s.seek(std::io::SeekFrom::Start(tail_offset)).await.is_ok() {
-                        let mut buf = [0u8; 4096];
-                        let _ = tokio::select! {
-                            _ = cancel_tail.changed() => {}
-                            _ = tokio::time::timeout(Duration::from_secs(20), s.read(&mut buf)) => {}
-                        };
+                let head_ok = if let Ok(mut head_stream) = handle_pw.clone().stream(selected_idx) {
+                    let mut buf = [0u8; 4096];
+                    tokio::select! {
+                        _ = cancel_pw.changed() => false,
+                        res = tokio::time::timeout(Duration::from_secs(60), head_stream.read(&mut buf)) => {
+                            matches!(res, Ok(Ok(n)) if n > 0)
+                        }
+                    }
+                } else {
+                    false
+                };
+
+                if head_ok {
+                    if let Some(tail_pos) = tail_offset {
+                        if let Ok(mut tail_stream) = handle_pw.stream(selected_idx) {
+                            if tail_stream.seek(std::io::SeekFrom::Start(tail_pos)).await.is_ok() {
+                                let mut buf = [0u8; 4096];
+                                let _ = tokio::select! {
+                                    _ = cancel_pw.changed() => {}
+                                    _ = tokio::time::timeout(Duration::from_secs(20), tail_stream.read(&mut buf)) => {}
+                                };
+                            }
+                        }
                     }
                 }
             }))
-        } else {
-            None
         };
 
         *self.inner.active.write().await = Some(ActiveTorrentSession {
@@ -782,12 +860,20 @@ fn extract_peer_counts(stats: &librqbit::TorrentStats) -> (u64, u64) {
 
 fn extract_speeds_bps(stats: &librqbit::TorrentStats) -> (u64, u64) {
     if let Some(live) = &stats.live {
-        // librqbit Speed::mbps is megabytes/sec (10^6 bytes/sec or MiB/s)
+        // librqbit Speed::mbps is megabytes/sec
         let dl = (live.download_speed.mbps * 1_000_000.0).max(0.0) as u64;
         let ul = (live.upload_speed.mbps * 1_000_000.0).max(0.0) as u64;
         (dl, ul)
     } else {
         (0, 0)
+    }
+}
+
+fn extract_fetched_bytes(stats: &librqbit::TorrentStats) -> u64 {
+    if let Some(live) = &stats.live {
+        live.snapshot.fetched_bytes
+    } else {
+        0
     }
 }
 

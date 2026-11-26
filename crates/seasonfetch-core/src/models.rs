@@ -93,6 +93,8 @@ pub struct PlayerPreferences {
     pub hardware_decoding: bool,
     #[serde(default)]
     pub mpv_executable_path: String,
+    #[serde(default)]
+    pub external_player_path: String,
 }
 
 impl Default for PlayerPreferences {
@@ -114,6 +116,7 @@ impl Default for PlayerPreferences {
             auto_next_episode: true,
             hardware_decoding: true,
             mpv_executable_path: String::new(),
+            external_player_path: String::new(),
         }
     }
 }
@@ -249,13 +252,17 @@ pub fn sanitize_settings(mut input: DesktopSettings, allow_localhost: bool) -> D
 
     // Sanitize player preferences
     input.player.preferred_engine = match input.player.preferred_engine.as_str() {
-        "auto" | "embedded-libmpv" | "embedded-libvlc" | "webview" | "external-mpv" => {
-            input.player.preferred_engine
-        }
+        "auto"
+        | "embedded-libmpv"
+        | "embedded-libvlc"
+        | "webview"
+        | "external-mpv"
+        | "external-player" => input.player.preferred_engine,
         "mpv" => "embedded-libmpv".to_string(),
         "embedded" => "auto".to_string(),
         _ => "auto".to_string(),
     };
+    input.player.external_player_path = input.player.external_player_path.trim().to_string();
     input.player.playback_speed = input.player.playback_speed.clamp(0.25, 4.0);
     input.player.default_volume = input.player.default_volume.clamp(0.0, 1.0);
     if !matches!(input.player.aspect_ratio.as_str(), "auto" | "16:9" | "21:9" | "4:3" | "fill") {

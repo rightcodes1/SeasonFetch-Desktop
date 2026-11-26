@@ -401,6 +401,26 @@ export async function launchNativeMpv({ target, title, startSecs = 0, subtitleFi
   return { ok: false, engine: 'mpv', error: 'Native MPV launch requires the Tauri desktop runtime.' };
 }
 
+export async function launchCustomExternalPlayer({
+  target,
+  title,
+  startSecs = 0,
+  subtitleFile = null,
+  executablePath = null
+}) {
+  if (isTauriRuntime()) {
+    return invoke('launch_custom_external_player', {
+      args: { target, title, startSecs, subtitleFile, executablePath }
+    });
+  }
+  return { ok: false, engine: 'external-player', error: 'External player launch requires the Tauri desktop runtime.' };
+}
+
+export async function pickExternalPlayerExe() {
+  if (isTauriRuntime()) return invoke('pick_external_player_exe');
+  return { ok: false, error: 'File picker requires the Tauri desktop runtime.' };
+}
+
 export async function pickLocalMediaFile() {
   if (isTauriRuntime()) return invoke('pick_local_media_file');
   return { ok: false, error: 'Local file picker requires the Tauri desktop runtime.' };

@@ -25,6 +25,7 @@ import {
 } from '../player/subtitleEngine.js';
 import {
   isTauriRuntime,
+  launchCustomExternalPlayer,
   launchNativeMpv,
   nativePlayerCommand,
   nativePlayerLoad,
@@ -76,6 +77,8 @@ function cueAlignmentStyle(alignment, verticalPosPct) {
 function resolveInitialEngine(playerPrefs, playerBackend) {
   if (!isTauriRuntime()) return 'webview';
   const pref = playerPrefs?.preferredEngine || 'auto';
+  if (pref === 'external-player') return 'external-player';
+  if (pref === 'external-mpv' && playerBackend?.mpvAvailable) return 'external-player';
   if (pref === 'webview') return 'webview';
   if (pref === 'embedded-libvlc' && playerBackend?.libvlcAvailable) return 'embedded-libvlc';
   if ((pref === 'embedded-libmpv' || pref === 'mpv') && playerBackend?.libmpvAvailable) return 'embedded-libmpv';
@@ -111,11 +114,26 @@ export function PlayerOverlay({
   const lastSavedRef = useRef(0);
   const hideHudTimerRef = useRef(null);
   const latestPosRef = useRef({ pos: session?.resumeSecs || 0, dur: 0 });
+  const torrentStoppedRef = useRef(false);
+  const externalLaunchedUrlRef = useRef(null);
 
   const [activeEngine, setActiveEngine] = useState(() =>
     resolveInitialEngine(playerPrefs, playerBackend)
   );
+  const isExternalMode = activeEngine === 'external-player';
   const isNativeEngine = activeEngine === 'embedded-libmpv' || activeEngine === 'embedded-libvlc';
+  const [externalLaunched, setExternalLaunched] = useState(false);
+
+  // Sync activeEngine if playerBackend finished loading after mount
+  useEffect(() => {
+    if (!playerBackend) return;
+    if (activeEngine === 'webview' && (playerPrefs?.preferredEngine || 'auto') !== 'webview') {
+      const resolved = resolveInitialEngine(playerPrefs, playerBackend);
+      if (resolved !== activeEngine) {
+        setActiveEngine(resolved);
+      }
+    }
+  }, [activeEngine, playerBackend, playerPrefs]);
 
   const [playing, setPlaying] = useState(false);
   const [buffering, setBuffering] = useState(true);
@@ -132,8 +150,9 @@ export function PlayerOverlay({
   const [activeDrawer, setActiveDrawer] = useState(null); // 'subtitles' | 'settings' | null
   const [videoError, setVideoError] = useState('');
 
-  // Live native engine telemetry (codec, D3D11VA/SW, tracks)
+  // Live native engine telemetry (codec, D3D11VA/SW, voConfigured, tracks)
   const [nativeMeta, setNativeMeta] = useState({
+    voConfigured: false,
     hwdecCurrent: null,
     videoCodec: null,
     audioCodec: null,
@@ -180,6 +199,9 @@ export function PlayerOverlay({
     }
 
     let cancelled = false;
+    torrentStoppedRef.current = false;
+    externalLaunchedUrlRef.current = null;
+    setExternalLaunched(false);
     setResolvedTorrentUrl(null);
     setVideoError('');
     setBuffering(true);
@@ -225,9 +247,34 @@ export function PlayerOverlay({
     return () => {
       cancelled = true;
       unsubStream();
-      stopTorrentStream().catch(() => {});
+      if (!torrentStoppedRef.current) {
+        torrentStoppedRef.current = true;
+        stopTorrentStream().catch(() => {});
+      }
     };
   }, [session?.mediaKey, session?.torrentRequest, streamRetryTick]);
+
+  // Auto-launch user's chosen external player once the stream URL is ready in external-player mode
+  useEffect(() => {
+    if (!isExternalMode || !rawTarget) return;
+    if (externalLaunchedUrlRef.current === rawTarget) return;
+    externalLaunchedUrlRef.current = rawTarget;
+    setBuffering(false);
+    launchCustomExternalPlayer({
+      target: rawTarget,
+      title: session?.title || 'SeasonFetch Playback',
+      startSecs: session?.resumeSecs || 0,
+      subtitleFile: subFilePath,
+      executablePath: playerPrefs?.externalPlayerPath || null
+    }).then(res => {
+      if (res?.ok) {
+        setExternalLaunched(true);
+        onToast?.(`Launched stream in ${res.engine}`);
+      } else {
+        setVideoError(res?.error || 'Could not launch configured external player.');
+      }
+    });
+  }, [isExternalMode, onToast, playerPrefs?.externalPlayerPath, rawTarget, session?.resumeSecs, session?.title, subFilePath]);
 
   const persistProgress = useCallback((pos, dur) => {
     if (!session?.mediaKey || !dur || dur <= 0) return;
@@ -272,6 +319,8 @@ export function PlayerOverlay({
     let cancelled = false;
     setVideoError('');
     setBuffering(true);
+    setPlaying(false);
+    setNativeMeta(prev => ({ ...prev, voConfigured: false }));
 
     const unsubscribe = subscribeNativePlayerState(st => {
       if (cancelled || !st) return;
@@ -292,6 +341,7 @@ export function PlayerOverlay({
       if (st.error) setVideoError(st.error);
 
       setNativeMeta({
+        voConfigured: Boolean(st.voConfigured),
         hwdecCurrent: st.hwdecCurrent || null,
         videoCodec: st.videoCodec || null,
         audioCodec: st.audioCodec || null,
@@ -492,10 +542,11 @@ export function PlayerOverlay({
   }, [isNativeEngine, onUpdatePlayerPrefs]);
 
   const handleClosePlayer = useCallback(async () => {
-    if (isTorrentSession) {
-      // Stop torrent stream alongside native player so HTTP sockets release immediately
-      stopTorrentStream().catch(() => {});
-    }
+    const stopStreamPromise =
+      isTorrentSession && !torrentStoppedRef.current
+        ? ((torrentStoppedRef.current = true), stopTorrentStream().catch(() => {}))
+        : Promise.resolve();
+
     if (isNativeEngine) {
       const { pos, dur } = latestPosRef.current;
       if (dur > 0) persistProgress(pos, dur);
@@ -506,9 +557,7 @@ export function PlayerOverlay({
         persistProgress(video.currentTime, video.duration);
       }
     }
-    if (isTorrentSession) {
-      await stopTorrentStream().catch(() => {});
-    }
+    await stopStreamPromise;
     if (fullscreen) {
       await windowControls.setFullscreen(false).catch(() => {});
     }
@@ -608,23 +657,32 @@ export function PlayerOverlay({
     }
   }
 
-  async function handleLaunchExternalMpv() {
+  async function handleLaunchExternalPlayer() {
     if (!rawTarget) return;
     if (isNativeEngine) {
       await nativePlayerCommand('set_paused', true).catch(() => {});
     } else if (videoRef.current) {
       videoRef.current.pause();
     }
-    const res = await launchNativeMpv({
-      target: rawTarget,
-      title: session.title,
-      startSecs: currentTime,
-      subtitleFile: subFilePath
-    });
+    const customExe = playerPrefs?.externalPlayerPath?.trim() || null;
+    const res = customExe
+      ? await launchCustomExternalPlayer({
+          target: rawTarget,
+          title: session.title,
+          startSecs: currentTime,
+          subtitleFile: subFilePath,
+          executablePath: customExe
+        })
+      : await launchNativeMpv({
+          target: rawTarget,
+          title: session.title,
+          startSecs: currentTime,
+          subtitleFile: subFilePath
+        });
     if (res?.ok) {
-      onToast?.('Opened in external MPV window');
+      onToast?.(`Opened in ${res.engine || 'external player'}`);
     } else {
-      onToast?.(res?.error || 'External mpv.exe not found on PATH.');
+      onToast?.(res?.error || 'External player could not be launched.');
     }
   }
 
@@ -648,14 +706,30 @@ export function PlayerOverlay({
       ? 'libmpv'
       : activeEngine === 'embedded-libvlc'
         ? 'libVLC'
-        : 'WebView2';
+        : activeEngine === 'external-player'
+          ? 'External'
+          : 'WebView2';
+
+  const hasExternalPlayerConfigured = Boolean(
+    playerPrefs?.externalPlayerPath?.trim() ||
+    playerBackend?.mpvAvailable ||
+    playerBackend?.vlcAvailable
+  );
+
+  // Keep the player backdrop solid dark until native video output is actually
+  // configured and presenting frames (prevents transparent window bleed-through).
+  const showOpaqueBackdrop =
+    !rawTarget ||
+    isExternalMode ||
+    (isNativeEngine && !nativeMeta.voConfigured && !playing);
 
   const hwBadge = useMemo(() => {
+    if (isExternalMode) return 'Custom';
     if (!isNativeEngine) return 'HTML5';
     const hw = nativeMeta.hwdecCurrent;
     if (!hw || hw === 'no') return 'Software';
     return hw.toUpperCase();
-  }, [isNativeEngine, nativeMeta.hwdecCurrent]);
+  }, [isExternalMode, isNativeEngine, nativeMeta.hwdecCurrent]);
 
   const codecSummary = useMemo(() => {
     const parts = [engineLabel];
@@ -670,11 +744,64 @@ export function PlayerOverlay({
 
   return (
     <div
-      className={`sf-player-overlay ${isNativeEngine ? 'is-native-surface' : ''} ${!rawTarget ? 'is-preloading' : ''} ${hudVisible || !playing ? 'hud-open' : 'hud-hidden'}`}
+      className={`sf-player-overlay ${isNativeEngine ? 'is-native-surface' : ''} ${showOpaqueBackdrop ? 'is-preloading' : ''} ${hudVisible || !playing ? 'hud-open' : 'hud-hidden'}`}
       onMouseMove={revealHud}
     >
-      {/* Interactive transparent click surface when native libmpv/libVLC renders beneath WebView2 */}
-      {isNativeEngine ? (
+      {/* External Player Hand-off Stage (keeps embedded torrent HTTP server alive) */}
+      {isExternalMode ? (
+        <div className="sf-native-stage">
+          <div className="sf-stream-buffering-card" onClick={e => e.stopPropagation()}>
+            <div className="sf-stream-buffering-head">
+              {!rawTarget ? <Loader2 size={18} className="sf-spin" /> : <ExternalLink size={18} />}
+              <div>
+                <strong>
+                  {!rawTarget
+                    ? 'Starting Torrent Stream for External Player'
+                    : externalLaunchedName
+                      ? `Streaming to ${externalLaunchedName}`
+                      : 'Ready for External Player'}
+                </strong>
+                <span>
+                  {!rawTarget
+                    ? streamStatus?.statusMessage || 'Connecting to peers...'
+                    : 'Keep this window open while watching — SeasonFetch is serving the live local HTTP stream.'}
+                </span>
+              </div>
+            </div>
+            {streamStatus?.fileName && (
+              <div className="sf-stream-file-line">
+                <span>{streamStatus.fileName}</span>
+                {streamStatus.totalBytes > 0 && (
+                  <span className="sf-mono-sm">{formatSizeCompact(streamStatus.totalBytes)}</span>
+                )}
+              </div>
+            )}
+            {isTorrentSession && (
+              <div className="sf-stream-metrics-row">
+                <span>Peers: <strong>{streamStatus?.peersConnected ?? 0}</strong>{streamStatus?.peersSeen ? ` / ${streamStatus.peersSeen} seen` : ''}</span>
+                <span>Speed: <strong>{formatSpeedBps(streamStatus?.downloadSpeedBps || 0)}</strong></span>
+                <span>Buffered: <strong>{(streamStatus?.progressPercent || 0).toFixed(1)}%</strong></span>
+              </div>
+            )}
+            {rawTarget && (
+              <div className="sf-btn-row" style={{ marginTop: 12 }}>
+                <button type="button" className="sf-primary-btn" onClick={handleLaunchExternalPlayer}>
+                  <ExternalLink size={14} /> Relaunch External Player
+                </button>
+                {playerBackend?.libmpvAvailable && (
+                  <button
+                    type="button"
+                    className="sf-secondary-btn"
+                    onClick={() => setActiveEngine('embedded-libmpv')}
+                  >
+                    Play Inside SeasonFetch
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+      ) : isNativeEngine ? (
         <div
           className="sf-native-stage"
           onClick={() => {
@@ -858,9 +985,9 @@ export function PlayerOverlay({
                 Retry with Software Decoding
               </button>
             )}
-            {rawTarget && playerBackend?.mpvAvailable && (
-              <button type="button" className="sf-ghost-btn" onClick={handleLaunchExternalMpv}>
-                <ExternalLink size={14} /> Open External MPV
+            {rawTarget && hasExternalPlayerConfigured && (
+              <button type="button" className="sf-ghost-btn" onClick={handleLaunchExternalPlayer}>
+                <ExternalLink size={14} /> Open External Player
               </button>
             )}
             <button type="button" className="sf-secondary-btn" onClick={handleClosePlayer}>
@@ -889,15 +1016,15 @@ export function PlayerOverlay({
           <span className="sf-engine-badge" title="Active native playback engine and hardware decoder status">
             <Cpu size={12} /> {codecSummary}
           </span>
-          {rawTarget && playerBackend?.mpvAvailable && (
+          {rawTarget && hasExternalPlayerConfigured && !isExternalMode && (
             <button
               type="button"
               className="sf-player-pill-btn"
-              onClick={handleLaunchExternalMpv}
-              title={`Open in external MPV (${playerBackend.mpvPath})`}
+              onClick={handleLaunchExternalPlayer}
+              title={`Open in external player (${playerPrefs?.externalPlayerPath || playerBackend?.mpvPath || playerBackend?.vlcPath})`}
             >
               <ExternalLink size={13} />
-              <span>External MPV</span>
+              <span>External Player</span>
             </button>
           )}
         </div>
@@ -1024,6 +1151,9 @@ export function PlayerOverlay({
               )}
               {playerBackend?.libvlcAvailable && (
                 <option value="embedded-libvlc">Embedded libVLC (System VLC)</option>
+              )}
+              {hasExternalPlayerConfigured && (
+                <option value="external-player">External Player (Custom .exe)</option>
               )}
               <option value="webview">WebView2 HTML5 (Fallback)</option>
             </select>

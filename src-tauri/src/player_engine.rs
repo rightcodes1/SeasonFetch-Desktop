@@ -28,6 +28,8 @@ pub struct LaunchMpvArgs {
     pub title: String,
     pub start_secs: Option<f64>,
     pub subtitle_file: Option<String>,
+    #[serde(default)]
+    pub executable_path: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -360,6 +362,111 @@ pub fn launch_native_mpv(args: LaunchMpvArgs, prefs: &PlayerPreferences) -> Laun
             ok: false,
             engine: "mpv".to_string(),
             error: Some(format!("Failed to launch native MPV: {err}")),
+        },
+    }
+}
+
+/// Launch ANY user-chosen external Windows media player (MPV, VLC, MPC-HC, PotPlayer, etc.)
+/// pointed at a local file or SeasonFetch's embedded loopback HTTP stream URL.
+pub fn launch_external_player(args: LaunchMpvArgs, prefs: &PlayerPreferences) -> LaunchMpvResult {
+    let target = args.target.trim();
+    if target.is_empty() {
+        return LaunchMpvResult {
+            ok: false,
+            engine: "external-player".to_string(),
+            error: Some("A playable local file or HTTP/HTTPS stream URL is required.".to_string()),
+        };
+    }
+
+    let configured = args
+        .executable_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            let p = prefs.external_player_path.trim();
+            if p.is_empty() { None } else { Some(p) }
+        });
+
+    let exe_path = match configured {
+        Some(p) => {
+            let pb = PathBuf::from(p);
+            if pb.exists() && pb.is_file() {
+                pb
+            } else {
+                return LaunchMpvResult {
+                    ok: false,
+                    engine: "external-player".to_string(),
+                    error: Some(format!(
+                        "Configured external player executable was not found: {p}. Pick a valid .exe in Settings → Player."
+                    )),
+                };
+            }
+        }
+        None => {
+            if let Some(mpv) = detect_mpv_executable(&prefs.mpv_executable_path) {
+                mpv
+            } else if let Some(vlc) = detect_vlc_executable() {
+                vlc
+            } else {
+                return LaunchMpvResult {
+                    ok: false,
+                    engine: "external-player".to_string(),
+                    error: Some(
+                        "No external player is configured. Choose your preferred player (.exe) in Settings → Player."
+                            .to_string(),
+                    ),
+                };
+            }
+        }
+    };
+
+    let exe_name = exe_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("player")
+        .to_ascii_lowercase();
+
+    if exe_name.contains("mpv") {
+        let mut mpv_prefs = prefs.clone();
+        mpv_prefs.mpv_executable_path = exe_path.to_string_lossy().to_string();
+        return launch_native_mpv(args, &mpv_prefs);
+    }
+
+    let mut cmd = Command::new(&exe_path);
+    if exe_name.contains("vlc") {
+        cmd.arg("--http-reconnect")
+            .arg("--network-caching=3000")
+            .arg(format!("--meta-title=SeasonFetch — {}", args.title));
+        if let Some(start) = args.start_secs {
+            if start > 2.0 {
+                cmd.arg(format!("--start-time={:.0}", start));
+            }
+        }
+        if let Some(sub) = args
+            .subtitle_file
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            cmd.arg(format!("--sub-file={sub}"));
+        }
+    }
+    cmd.arg(target);
+
+    match cmd.spawn() {
+        Ok(_) => LaunchMpvResult {
+            ok: true,
+            engine: exe_name,
+            error: None,
+        },
+        Err(err) => LaunchMpvResult {
+            ok: false,
+            engine: exe_name,
+            error: Some(format!(
+                "Failed to launch external player ({}): {err}",
+                exe_path.display()
+            )),
         },
     }
 }

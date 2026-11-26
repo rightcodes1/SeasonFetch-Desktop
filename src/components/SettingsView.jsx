@@ -48,6 +48,7 @@ export function SettingsView({
   onRefreshMagnetHandler,
   onRefreshCatalogs,
   onRefreshPlayerStatus,
+  onPickExternalPlayer,
   onClearCache,
   onClearStreamCache,
   onClearHistory,
@@ -369,6 +370,9 @@ export function SettingsView({
                   <option value="embedded-libvlc" disabled={!playerBackend?.libvlcAvailable}>
                     Embedded libVLC (System VLC)
                   </option>
+                  <option value="external-player">
+                    External Player (Custom .exe)
+                  </option>
                   <option value="webview">WebView2 HTML5 (Fallback)</option>
                   <option value="external-mpv" disabled={!playerBackend?.mpvAvailable}>
                     External MPV Window
@@ -460,16 +464,45 @@ export function SettingsView({
 
               <div className="sf-setting-row">
                 <div className="sf-setting-copy">
-                  <strong>External MPV Path (Optional)</strong>
-                  <p className="sf-muted-sm">Only needed if launching an external mpv.exe window.</p>
+                  <strong>External Player Executable</strong>
+                  <p className="sf-muted-sm">
+                    Pick any Windows player (.exe) — VLC, MPV, PotPlayer, MPC-HC, etc. Used when Playback Engine is set to External Player or when clicking External Player in the HUD.
+                  </p>
+                  {(playerBackend?.vlcPath || playerBackend?.mpvPath) && (
+                    <div className="sf-btn-row" style={{ marginTop: 6 }}>
+                      {playerBackend?.vlcPath && (
+                        <button
+                          type="button"
+                          className="sf-ghost-btn sf-sm"
+                          onClick={() => patchPlayer({ externalPlayerPath: playerBackend.vlcPath })}
+                        >
+                          Use VLC
+                        </button>
+                      )}
+                      {playerBackend?.mpvPath && (
+                        <button
+                          type="button"
+                          className="sf-ghost-btn sf-sm"
+                          onClick={() => patchPlayer({ externalPlayerPath: playerBackend.mpvPath })}
+                        >
+                          Use MPV
+                        </button>
+                      )}
+                    </div>
+                  )}
                 </div>
-                <input
-                  className="sf-input sf-setting-control"
-                  type="text"
-                  value={player.mpvExecutablePath || ''}
-                  placeholder="Auto-detected if installed"
-                  onChange={e => patchPlayer({ mpvExecutablePath: e.target.value })}
-                />
+                <div className="sf-btn-row">
+                  <input
+                    className="sf-input sf-setting-control"
+                    type="text"
+                    value={player.externalPlayerPath || ''}
+                    placeholder="C:\Program Files\...\player.exe"
+                    onChange={e => patchPlayer({ externalPlayerPath: e.target.value })}
+                  />
+                  <button type="button" className="sf-secondary-btn sf-sm" onClick={onPickExternalPlayer}>
+                    Browse .exe
+                  </button>
+                </div>
               </div>
             </div>
           )}

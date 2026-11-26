@@ -17,8 +17,11 @@ use windows_sys::Win32::System::LibraryLoader::SetDllDirectoryW;
 
 // libVLC 3.x C ABI structures & constants
 const LIBVLC_MEDIA_SLAVE_TYPE_SUBTITLE: c_uint = 0;
+const LIBVLC_STATE_OPENING: c_int = 1;
+const LIBVLC_STATE_BUFFERING: c_int = 2;
 const LIBVLC_STATE_PLAYING: c_int = 3;
 const LIBVLC_STATE_PAUSED: c_int = 4;
+const LIBVLC_STATE_STOPPED: c_int = 5;
 const LIBVLC_STATE_ENDED: c_int = 6;
 const LIBVLC_STATE_ERROR: c_int = 7;
 
@@ -212,6 +215,9 @@ impl EmbeddedLibVlc {
                     CString::new("--no-video-title-show").unwrap(),
                     CString::new("--quiet").unwrap(),
                     CString::new("--avcodec-hw=any").unwrap(),
+                    CString::new("--http-reconnect").unwrap(),
+                    CString::new("--network-caching=3000").unwrap(),
+                    CString::new("--file-caching=1000").unwrap(),
                     CString::new("--no-mouse-events").unwrap(),
                     CString::new("--no-keyboard-events").unwrap(),
                 ];
@@ -234,6 +240,8 @@ impl EmbeddedLibVlc {
                 let _ = ready_tx.send(Ok(()));
 
                 let mut pending_seek_ms: Option<i64> = None;
+                let mut seen_opening_or_playing = false;
+                let mut track_poll_ticks: u32 = 0;
                 let mut running = true;
 
                 while running {
@@ -296,9 +304,16 @@ impl EmbeddedLibVlc {
                                 pending_seek_ms = start_secs
                                     .filter(|s| *s > 2.0)
                                     .map(|s| (s * 1000.0).round() as i64);
+                                seen_opening_or_playing = false;
+                                track_poll_ticks = 0;
                                 if let Ok(mut st) = state_thread.lock() {
                                     st.active = true;
+                                    st.playing = false;
+                                    st.paused = false;
                                     st.buffering = true;
+                                    st.vo_configured = false;
+                                    st.position_secs = 0.0;
+                                    st.duration_secs = 0.0;
                                     st.eof_reached = false;
                                     st.error = None;
                                     st.hwdec_mode = if prefs.hardware_decoding {
@@ -306,18 +321,30 @@ impl EmbeddedLibVlc {
                                     } else {
                                         "no".to_string()
                                     };
+                                    st.hwdec_current = Some(if prefs.hardware_decoding {
+                                        "auto".to_string()
+                                    } else {
+                                        "no".to_string()
+                                    });
+                                    st.audio_tracks.clear();
+                                    st.subtitle_tracks.clear();
                                     on_state(st.clone());
                                 }
                             }
                             VlcCmd::Stop => {
                                 unsafe { (syms.libvlc_media_player_stop)(mp) };
                                 pending_seek_ms = None;
+                                seen_opening_or_playing = false;
                                 if let Ok(mut st) = state_thread.lock() {
                                     st.active = false;
                                     st.playing = false;
                                     st.paused = false;
+                                    st.buffering = false;
+                                    st.vo_configured = false;
                                     st.position_secs = 0.0;
                                     st.duration_secs = 0.0;
+                                    st.eof_reached = false;
+                                    st.error = None;
                                     st.audio_tracks.clear();
                                     st.subtitle_tracks.clear();
                                     on_state(st.clone());
@@ -420,6 +447,13 @@ impl EmbeddedLibVlc {
                         let time_ms = unsafe { (syms.libvlc_media_player_get_time)(mp) };
                         let len_ms = unsafe { (syms.libvlc_media_player_get_length)(mp) };
 
+                        if matches!(
+                            vlc_state,
+                            LIBVLC_STATE_OPENING | LIBVLC_STATE_BUFFERING | LIBVLC_STATE_PLAYING | LIBVLC_STATE_PAUSED
+                        ) {
+                            seen_opening_or_playing = true;
+                        }
+
                         if vlc_state == LIBVLC_STATE_PLAYING {
                             if let Some(seek_ms) = pending_seek_ms.take() {
                                 if len_ms <= 0 || seek_ms < len_ms - 8000 {
@@ -428,18 +462,54 @@ impl EmbeddedLibVlc {
                             }
                         }
 
-                        let sel_audio = unsafe { (syms.libvlc_audio_get_track)(mp) } as i64;
-                        let sel_sub = unsafe { (syms.libvlc_video_get_spu)(mp) } as i64;
-                        let audio_tracks = read_vlc_tracks(&syms, unsafe { (syms.libvlc_audio_get_track_description)(mp) }, "audio", sel_audio);
-                        let subtitle_tracks = read_vlc_tracks(&syms, unsafe { (syms.libvlc_video_get_spu_description)(mp) }, "subtitle", sel_sub);
+                        let mut polled_tracks: Option<(Vec<MediaTrack>, Vec<MediaTrack>, Option<i64>, Option<i64>)> = None;
+                        if matches!(vlc_state, LIBVLC_STATE_PLAYING | LIBVLC_STATE_PAUSED) {
+                            track_poll_ticks = track_poll_ticks.wrapping_add(1);
+                            if track_poll_ticks == 1 || track_poll_ticks % 5 == 0 {
+                                let sel_audio = unsafe { (syms.libvlc_audio_get_track)(mp) } as i64;
+                                let sel_sub = unsafe { (syms.libvlc_video_get_spu)(mp) } as i64;
+                                let audio_tracks = read_vlc_tracks(
+                                    &syms,
+                                    unsafe { (syms.libvlc_audio_get_track_description)(mp) },
+                                    "audio",
+                                    sel_audio,
+                                );
+                                let subtitle_tracks = read_vlc_tracks(
+                                    &syms,
+                                    unsafe { (syms.libvlc_video_get_spu_description)(mp) },
+                                    "subtitle",
+                                    sel_sub,
+                                );
+                                polled_tracks = Some((
+                                    audio_tracks,
+                                    subtitle_tracks,
+                                    if sel_audio > 0 { Some(sel_audio) } else { None },
+                                    if sel_sub > 0 { Some(sel_sub) } else { None },
+                                ));
+                            }
+                        }
 
                         if let Ok(mut st) = state_thread.lock() {
                             st.playing = vlc_state == LIBVLC_STATE_PLAYING;
                             st.paused = vlc_state == LIBVLC_STATE_PAUSED;
-                            st.buffering = vlc_state < LIBVLC_STATE_PLAYING;
+                            st.buffering = matches!(vlc_state, 0 | LIBVLC_STATE_OPENING | LIBVLC_STATE_BUFFERING);
                             st.eof_reached = vlc_state == LIBVLC_STATE_ENDED;
                             if vlc_state == LIBVLC_STATE_ERROR {
-                                st.error = Some("libVLC reported a playback/decoder error.".to_string());
+                                st.active = false;
+                                st.buffering = false;
+                                st.vo_configured = false;
+                                st.error = Some(
+                                    "libVLC failed to decode or open this stream. Switch to Embedded libmpv (recommended) for best torrent & HEVC/ASS playback."
+                                        .to_string(),
+                                );
+                            } else if vlc_state == LIBVLC_STATE_STOPPED && seen_opening_or_playing {
+                                st.active = false;
+                                st.buffering = false;
+                                st.vo_configured = false;
+                                st.error = Some(
+                                    "libVLC stopped while buffering the stream (HTTP timeout or unsupported codec). Switch to Embedded libmpv or retry."
+                                        .to_string(),
+                                );
                             }
                             if time_ms >= 0 {
                                 st.position_secs = time_ms as f64 / 1000.0;
@@ -448,10 +518,12 @@ impl EmbeddedLibVlc {
                                 st.duration_secs = len_ms as f64 / 1000.0;
                             }
                             st.vo_configured = st.playing || st.paused;
-                            st.audio_tracks = audio_tracks;
-                            st.subtitle_tracks = subtitle_tracks;
-                            st.selected_audio_id = if sel_audio > 0 { Some(sel_audio) } else { None };
-                            st.selected_subtitle_id = if sel_sub > 0 { Some(sel_sub) } else { None };
+                            if let Some((audio_tracks, subtitle_tracks, sel_a, sel_s)) = polled_tracks {
+                                st.audio_tracks = audio_tracks;
+                                st.subtitle_tracks = subtitle_tracks;
+                                st.selected_audio_id = sel_a;
+                                st.selected_subtitle_id = sel_s;
+                            }
                             on_state(st.clone());
                         }
                     }

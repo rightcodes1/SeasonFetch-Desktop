@@ -10,28 +10,46 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, ReadBuf};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio_util::io::ReaderStream;
 
 /// RAII wrapper around an async reader that:
-/// 1. Tracks active HTTP stream count (`active_http_streams`), and
-/// 2. Immediately returns EOF/aborts if the session's cancellation signal fires (e.g., on player close),
+/// 1. Tracks active HTTP stream count (`active_http_streams`),
+/// 2. Logs time-to-first-byte (TTFB) and errors to the engine log sink, and
+/// 3. Immediately aborts if the session's cancellation signal fires (e.g., on player close),
 ///    releasing `FileStream` and Windows file handles in milliseconds so cache deletion succeeds cleanly.
 struct TrackedReader<R> {
     inner: R,
     counter: Arc<AtomicU32>,
     cancel_rx: watch::Receiver<bool>,
+    engine: TorrentStreamingEngine,
+    range_label: String,
+    started_at: Instant,
+    first_byte_logged: bool,
+    bytes_sent: u64,
 }
 
 impl<R> TrackedReader<R> {
-    fn new(inner: R, counter: Arc<AtomicU32>, cancel_rx: watch::Receiver<bool>) -> Self {
+    fn new(
+        inner: R,
+        counter: Arc<AtomicU32>,
+        cancel_rx: watch::Receiver<bool>,
+        engine: TorrentStreamingEngine,
+        range_label: String,
+    ) -> Self {
         counter.fetch_add(1, Ordering::Relaxed);
         Self {
             inner,
             counter,
             cancel_rx,
+            engine,
+            range_label,
+            started_at: Instant::now(),
+            first_byte_logged: false,
+            bytes_sent: 0,
         }
     }
 }
@@ -39,6 +57,13 @@ impl<R> TrackedReader<R> {
 impl<R> Drop for TrackedReader<R> {
     fn drop(&mut self) {
         self.counter.fetch_sub(1, Ordering::Relaxed);
+        if !self.first_byte_logged {
+            self.engine.log_event(&format!(
+                "HTTP stream closed before first byte ({}) after {}ms",
+                self.range_label,
+                self.started_at.elapsed().as_millis()
+            ));
+        }
     }
 }
 
@@ -54,7 +79,28 @@ impl<R: AsyncRead + Unpin> AsyncRead for TrackedReader<R> {
                 "streaming session stopped",
             )));
         }
-        Pin::new(&mut self.inner).poll_read(cx, buf)
+        let before = buf.filled().len();
+        let res = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = &res {
+            let delta = buf.filled().len().saturating_sub(before) as u64;
+            if delta > 0 {
+                self.bytes_sent = self.bytes_sent.saturating_add(delta);
+                if !self.first_byte_logged {
+                    self.first_byte_logged = true;
+                    self.engine.log_event(&format!(
+                        "HTTP first byte delivered ({}) in {}ms",
+                        self.range_label,
+                        self.started_at.elapsed().as_millis()
+                    ));
+                }
+            }
+        } else if let Poll::Ready(Err(err)) = &res {
+            self.engine.log_event(&format!(
+                "HTTP read error ({}) after {} bytes: {err}",
+                self.range_label, self.bytes_sent
+            ));
+        }
+        res
     }
 }
 
@@ -230,8 +276,13 @@ async fn serve_get(
     }
 
     let content_length = end - start + 1;
+    let range_label = format!("fileIdx={idx} bytes={start}-{end}/{file_len}");
+    engine.log_event(&format!(
+        "HTTP GET {} ({status_code}, {content_length} bytes)",
+        range_label
+    ));
     let bounded = file_stream.take(content_length);
-    let tracked = TrackedReader::new(bounded, active_counter, cancel_rx);
+    let tracked = TrackedReader::new(bounded, active_counter, cancel_rx, engine, range_label);
     let stream = ReaderStream::with_capacity(tracked, 64 * 1024);
 
     let mut builder = Response::builder()

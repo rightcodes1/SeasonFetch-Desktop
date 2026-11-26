@@ -13,8 +13,8 @@ use chrono::Utc;
 use logger::DesktopLogger;
 use native_player::NativePlaybackManager;
 use player_engine::{
-    get_playback_backend_info, get_streaming_engine_status, launch_native_mpv,
-    resolve_source_command, LaunchMpvArgs, LaunchMpvResult, ResolveSourceArgs,
+    get_playback_backend_info, get_streaming_engine_status, launch_external_player,
+    launch_native_mpv, resolve_source_command, LaunchMpvArgs, LaunchMpvResult, ResolveSourceArgs,
 };
 use protocol::{inspect_windows_magnet_handler, open_external_url, ExternalOpenResult, MagnetHandlerInfo};
 use seasonfetch_core::models::{
@@ -354,6 +354,46 @@ fn launch_mpv(args: LaunchMpvArgs, state: State<'_, AppState>) -> LaunchMpvResul
 }
 
 #[tauri::command]
+fn launch_custom_external_player(args: LaunchMpvArgs, state: State<'_, AppState>) -> LaunchMpvResult {
+    let prefs = state.settings.get().player;
+    let res = launch_external_player(args, &prefs);
+    if !res.ok {
+        state.logger.warn(
+            "player",
+            res.error.as_deref().unwrap_or("External player launch failed"),
+        );
+    } else {
+        state
+            .logger
+            .info("player", &format!("Launched external player ({})", res.engine));
+    }
+    res
+}
+
+#[tauri::command]
+async fn pick_external_player_exe(app: AppHandle) -> Value {
+    let picked = app
+        .dialog()
+        .file()
+        .set_title("Choose External Media Player Executable")
+        .add_filter("Windows Executables", &["exe"])
+        .blocking_pick_file();
+
+    match picked {
+        Some(file_path) => {
+            let path_str = file_path.to_string();
+            let name = std::path::Path::new(&path_str)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("player.exe")
+                .to_string();
+            serde_json::json!({ "ok": true, "path": path_str, "name": name })
+        }
+        None => serde_json::json!({ "ok": false, "canceled": true }),
+    }
+}
+
+#[tauri::command]
 async fn pick_local_media_file(app: AppHandle) -> Value {
     let picked = app
         .dialog()
@@ -584,6 +624,12 @@ pub fn run() {
                 initial_settings.cache_max_mb as u64,
             )) {
                 Ok(engine) => {
+                    let stream_logger = logger.clone();
+                    let _ = tauri::async_runtime::block_on(engine.set_log_callback(Arc::new(
+                        move |msg: &str| {
+                            stream_logger.info("streaming", msg);
+                        },
+                    )));
                     logger.info(
                         "streaming",
                         &format!(
@@ -702,6 +748,11 @@ pub fn run() {
                         .position(|a| a == "--diag-seek")
                         .and_then(|i| cli_args.get(i + 1))
                         .and_then(|v| v.parse::<f64>().ok());
+                    let diag_engine = cli_args
+                        .iter()
+                        .position(|a| a == "--diag-engine")
+                        .and_then(|i| cli_args.get(i + 1))
+                        .cloned();
                     let app_handle = app.handle().clone();
                     tauri::async_runtime::spawn(async move {
                         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -712,7 +763,8 @@ pub fn run() {
                                     "diagMagnet": {
                                         "magnetUri": magnet_uri,
                                         "fileIdx": diag_file_idx,
-                                        "title": diag_title
+                                        "title": diag_title,
+                                        "engine": diag_engine
                                     }
                                 }),
                             );
@@ -734,13 +786,14 @@ pub fn run() {
                                 st.logger.info(
                                     "diag_torrent",
                                     &format!(
-                                        "T+{step}s stream={:?} s_err={:?} peers={} dl_bps={} progress={:.2}% http={} | mpv active={} playing={} vo={} codec={:?}/{:?} res={}x{} hwdec={:?} fps={:.2} pos={:.2}/{:.2} audio={} subs={} err={:?}",
+                                        "T+{step}s stream={:?} s_err={:?} peers={} dl_bps={} progress={:.2}% http={} | eng={} active={} playing={} vo={} codec={:?}/{:?} res={}x{} hwdec={:?} fps={:.2} pos={:.2}/{:.2} audio={} subs={} err={:?}",
                                         stream_snap.as_ref().map(|s| &s.state),
                                         stream_snap.as_ref().and_then(|s| s.error.as_deref()),
                                         stream_snap.as_ref().map(|s| s.peers_connected).unwrap_or(0),
                                         stream_snap.as_ref().map(|s| s.download_speed_bps).unwrap_or(0),
                                         stream_snap.as_ref().map(|s| s.progress_percent).unwrap_or(0.0),
                                         stream_snap.as_ref().map(|s| s.active_http_streams).unwrap_or(0),
+                                        snap.engine,
                                         snap.active,
                                         snap.playing,
                                         snap.vo_configured,
@@ -934,6 +987,8 @@ pub fn run() {
             stream_get_status,
             stream_clear_cache,
             launch_mpv,
+            launch_custom_external_player,
+            pick_external_player_exe,
             pick_local_media_file,
             pick_subtitle_file,
             save_text_file,

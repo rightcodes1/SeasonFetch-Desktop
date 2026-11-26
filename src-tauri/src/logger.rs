@@ -3,20 +3,21 @@ use seasonfetch_core::validation::redact_sensitive_text;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 const MAX_LOG_BYTES: u64 = 2 * 1024 * 1024;
 
+#[derive(Clone)]
 pub struct DesktopLogger {
     file_path: PathBuf,
-    lock: Mutex<()>,
+    lock: Arc<Mutex<()>>,
 }
 
 impl DesktopLogger {
     pub fn new(file_path: PathBuf) -> Self {
         Self {
             file_path,
-            lock: Mutex::new(()),
+            lock: Arc::new(Mutex::new(())),
         }
     }
 

@@ -463,13 +463,21 @@ impl EmbeddedLibMpv {
                 let _ = syms.set_opt_str(ctx, "sub-font-provider", "auto");
                 let _ = syms.set_opt_str(ctx, "hwdec", "auto-safe");
                 let _ = syms.set_opt_str(ctx, "cache", "yes");
+                let _ = syms.set_opt_str(ctx, "cache-pause", "yes");
+                let _ = syms.set_opt_str(ctx, "cache-pause-initial", "yes");
+                let _ = syms.set_opt_str(ctx, "cache-pause-wait", "2");
                 let _ = syms.set_opt_str(ctx, "network-timeout", "60");
                 let _ = syms.set_opt_str(ctx, "demuxer-max-bytes", "150MiB");
                 let _ = syms.set_opt_str(ctx, "demuxer-readahead-secs", "20");
                 let _ = syms.set_opt_str(
                     ctx,
                     "demuxer-lavf-o",
-                    "reconnect=1,reconnect_on_network_error=1,reconnect_delay_max=15",
+                    "reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_delay_max=10",
+                );
+                let _ = syms.set_opt_str(
+                    ctx,
+                    "stream-lavf-o",
+                    "reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_delay_max=10",
                 );
 
                 if headless || wid_hwnd == 0 {
@@ -595,9 +603,19 @@ impl EmbeddedLibMpv {
 
                                 if let Ok(mut st) = state_thread.lock() {
                                     st.active = true;
+                                    st.playing = false;
+                                    st.paused = false;
                                     st.buffering = true;
+                                    st.vo_configured = false;
+                                    st.position_secs = 0.0;
+                                    st.duration_secs = 0.0;
                                     st.eof_reached = false;
                                     st.error = None;
+                                    st.video_codec = None;
+                                    st.audio_codec = None;
+                                    st.video_width = 0;
+                                    st.video_height = 0;
+                                    st.estimated_fps = 0.0;
                                     st.hwdec_mode = hw.to_string();
                                     st.sub_delay_ms = prefs.subtitle_delay_ms;
                                     st.sub_pos = prefs.subtitle_vertical_pos;
@@ -627,10 +645,16 @@ impl EmbeddedLibMpv {
                                     st.playing = false;
                                     st.paused = false;
                                     st.buffering = false;
+                                    st.vo_configured = false;
                                     st.position_secs = 0.0;
                                     st.duration_secs = 0.0;
                                     st.eof_reached = false;
                                     st.error = None;
+                                    st.video_codec = None;
+                                    st.audio_codec = None;
+                                    st.video_width = 0;
+                                    st.video_height = 0;
+                                    st.estimated_fps = 0.0;
                                     st.audio_tracks.clear();
                                     st.subtitle_tracks.clear();
                                     on_state(st.clone());
@@ -875,7 +899,11 @@ impl EmbeddedLibMpv {
                                     ("pause", MPV_FORMAT_FLAG) if !prop.data.is_null() => {
                                         let paused = unsafe { *(prop.data as *const c_int) } != 0;
                                         st.paused = paused;
-                                        st.playing = st.active && !paused && !st.eof_reached;
+                                        st.playing = st.active
+                                            && !paused
+                                            && !st.eof_reached
+                                            && !st.buffering
+                                            && (st.vo_configured || st.duration_secs > 0.0);
                                         emit_now = true;
                                     }
                                     ("time-pos", MPV_FORMAT_DOUBLE) if !prop.data.is_null() => {
@@ -894,6 +922,11 @@ impl EmbeddedLibMpv {
                                     }
                                     ("paused-for-cache", MPV_FORMAT_FLAG) if !prop.data.is_null() => {
                                         st.buffering = unsafe { *(prop.data as *const c_int) } != 0;
+                                        st.playing = st.active
+                                            && !st.paused
+                                            && !st.eof_reached
+                                            && !st.buffering
+                                            && (st.vo_configured || st.duration_secs > 0.0);
                                         emit_now = true;
                                     }
                                     ("eof-reached", MPV_FORMAT_FLAG) if !prop.data.is_null() => {
@@ -955,6 +988,9 @@ impl EmbeddedLibMpv {
                                     }
                                     ("vo-configured", MPV_FORMAT_FLAG) if !prop.data.is_null() => {
                                         st.vo_configured = unsafe { *(prop.data as *const c_int) } != 0;
+                                        if st.vo_configured && !st.paused && !st.eof_reached && !st.buffering {
+                                            st.playing = st.active;
+                                        }
                                         emit_now = true;
                                     }
                                     ("current-vo", MPV_FORMAT_STRING) if !prop.data.is_null() => {

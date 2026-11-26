@@ -12,7 +12,7 @@ const {
   shell,
   session
 } = require('electron');
-const { autoUpdater } = require('electron-updater');
+const { autoUpdater, CancellationToken } = require('electron-updater');
 const { createSettingsStore } = require('./services/settingsStore.cjs');
 const { createAuthVault } = require('./services/authStore.cjs');
 const { createDesktopLogger } = require('./services/logger.cjs');
@@ -365,6 +365,7 @@ function registerIpcHandlers() {
   ipcMain.handle('desktop:updater-get-state', () => updaterController.getState());
   ipcMain.handle('desktop:updater-check', () => updaterController.checkForUpdates({ reason: 'manual' }));
   ipcMain.handle('desktop:updater-download', () => updaterController.downloadUpdate());
+  ipcMain.handle('desktop:updater-cancel-download', () => updaterController.cancelDownload());
   ipcMain.handle('desktop:updater-dismiss-recovery', () => updaterController.dismissRecovery());
   ipcMain.handle('desktop:updater-postpone', () => updaterController.postponeInstall());
   ipcMain.handle('desktop:updater-install-now', () => {
@@ -481,6 +482,7 @@ app.whenReady().then(() => {
     autoCheckUpdates: initialSettings.autoCheckUpdates,
     autoDownloadUpdates: initialSettings.autoDownloadUpdates,
     autoUpdater,
+    CancellationTokenClass: CancellationToken,
     stateFilePath: path.join(userDataDir, 'updater-state.json'),
     logger,
     onStateChange: broadcastUpdaterState

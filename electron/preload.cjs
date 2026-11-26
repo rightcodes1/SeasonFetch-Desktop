@@ -27,6 +27,7 @@ contextBridge.exposeInMainWorld('seasonfetchDesktop', Object.freeze({
     getState: () => ipcRenderer.invoke('desktop:updater-get-state'),
     check: () => ipcRenderer.invoke('desktop:updater-check'),
     download: () => ipcRenderer.invoke('desktop:updater-download'),
+    cancelDownload: () => ipcRenderer.invoke('desktop:updater-cancel-download'),
     dismissRecovery: () => ipcRenderer.invoke('desktop:updater-dismiss-recovery'),
     postpone: () => ipcRenderer.invoke('desktop:updater-postpone'),
     installNow: () => ipcRenderer.invoke('desktop:updater-install-now'),

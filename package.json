@@ -48,6 +48,7 @@
     ],
     "win": {
       "icon": "build/icon.ico",
+      "artifactName": "SeasonFetch-Setup-${version}.${ext}",
       "target": [
         {
           "target": "nsis",
@@ -70,9 +71,9 @@
       {
         "provider": "github",
         "owner": "rightcodes1",
-        "repo": "SeasonFetch-Desktop",
-        "private": true,
-        "releaseType": "draft"
+        "repo": "SeasonFetch-Desktop-Releases",
+        "private": false,
+        "releaseType": "release"
       }
     ]
   },

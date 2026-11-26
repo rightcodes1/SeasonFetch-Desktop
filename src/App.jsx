@@ -5,6 +5,7 @@ import {
   rankingPreferenceDescription
 } from '../shared/rankingPreferences.js';
 import {
+  cancelUpdateDownload,
   checkForUpdates,
   dismissUpdaterRecovery,
   downloadAvailableUpdate,
@@ -994,6 +995,7 @@ export default function App() {
           onInstallNow={installDownloadedUpdate}
           onPostpone={postponeUpdateInstall}
           onRetryDownload={downloadAvailableUpdate}
+          onCancelDownload={cancelUpdateDownload}
           onDismissRecovery={dismissUpdaterRecovery}
           onOpenReleases={openExternalUrl}
           onOpenUpdates={() => setActiveTab('updates')}
@@ -1793,11 +1795,13 @@ export default function App() {
                 <div className="meta-grid">
                   <div className="meta-cell">
                     <span className="section-kicker">UPDATE CHANNEL</span>
-                    <strong>{channelLabel}</strong>
+                    <strong>{channelLabel} ({updater?.updaterChannel || 'latest'})</strong>
                   </div>
                   <div className="meta-cell">
-                    <span className="section-kicker">AUTO CHECK</span>
-                    <strong>{updater?.autoCheckUpdates ? 'Launch + every 4h' : 'Manual only'}</strong>
+                    <span className="section-kicker">PUBLIC UPDATE FEED</span>
+                    <strong className="mono-caption" style={{ marginTop: 0 }}>
+                      {updater?.feedRepository || 'rightcodes1/SeasonFetch-Desktop-Releases'}
+                    </strong>
                   </div>
                   <div className="meta-cell">
                     <span className="section-kicker">LAST CHECKED</span>
@@ -1819,8 +1823,19 @@ export default function App() {
                     Check for Updates
                   </button>
 
+                  {updater?.status === 'downloading' && (
+                    <button
+                      type="button"
+                      className="secondary-button"
+                      onClick={() => cancelUpdateDownload()}
+                    >
+                      Cancel Download
+                    </button>
+                  )}
+
                   {(updater?.status === 'available' || updater?.status === 'error' || updater?.status === 'recovery')
-                    && updater?.errorCode !== 'SIGNATURE_VERIFICATION_FAILED' && (
+                    && updater?.errorCode !== 'SIGNATURE_VERIFICATION_FAILED'
+                    && updater?.errorCode !== 'INTEGRITY_VERIFICATION_FAILED' && (
                     <button
                       type="button"
                       className="secondary-button"

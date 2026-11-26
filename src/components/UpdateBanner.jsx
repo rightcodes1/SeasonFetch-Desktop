@@ -5,11 +5,15 @@ export function UpdateBanner({
   onInstallNow,
   onPostpone,
   onRetryDownload,
+  onCancelDownload,
   onDismissRecovery,
   onOpenReleases,
   onOpenUpdates
 }) {
   if (!updater) return null;
+
+  const isVerificationBlocked = updater.errorCode === 'SIGNATURE_VERIFICATION_FAILED'
+    || updater.errorCode === 'INTEGRITY_VERIFICATION_FAILED';
 
   if (updater.recoveryRequired) {
     return (
@@ -19,7 +23,7 @@ export function UpdateBanner({
           <span>{updater.recoveryMessage || updater.message}</span>
         </div>
         <div className="update-banner-actions">
-          {updater.errorCode !== 'SIGNATURE_VERIFICATION_FAILED' && (
+          {!isVerificationBlocked && (
             <button type="button" className="secondary-button small-button" onClick={onRetryDownload}>
               Retry Update
             </button>
@@ -53,8 +57,15 @@ export function UpdateBanner({
           <strong>Downloading SeasonFetch v{updater.availableVersion || 'next'}</strong>
           <span>{updater.progressPercent}% complete in the background{speedMb}</span>
         </div>
-        <div className="progress-track">
-          <div className="progress-fill" style={{ width: `${updater.progressPercent}%` }} />
+        <div className="update-banner-actions">
+          <div className="progress-track">
+            <div className="progress-fill" style={{ width: `${updater.progressPercent}%` }} />
+          </div>
+          {onCancelDownload && (
+            <button type="button" className="ghost-button small-button" onClick={onCancelDownload}>
+              Cancel
+            </button>
+          )}
         </div>
       </div>
     );

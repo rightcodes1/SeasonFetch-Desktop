@@ -3,7 +3,8 @@ const path = require('node:path');
 
 const DEFAULT_CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000;
 const INITIAL_CHECK_DELAY_MS = 5_000;
-const RELEASES_FALLBACK_URL = 'https://github.com/rightcodes1/SeasonFetch-Desktop/releases';
+const RELEASES_REPO_SLUG = 'rightcodes1/SeasonFetch-Desktop-Releases';
+const RELEASES_FALLBACK_URL = `https://github.com/${RELEASES_REPO_SLUG}/releases`;
 
 function resolveChannelConfig(channel) {
   const normalized = channel === 'preview' ? 'preview' : 'stable';
@@ -35,12 +36,31 @@ function classifyUpdaterError(error) {
   ) {
     return {
       code: 'UPDATE_SERVER_UNREACHABLE',
-      message: 'Update server is currently unreachable. SeasonFetch will retry automatically when you are back online.',
+      message: 'Update feed is currently unreachable. SeasonFetch will retry automatically when you are back online.',
       recoverable: true
     };
   }
 
-  if (lower.includes('signature') || lower.includes('sha512') || lower.includes('checksum') || lower.includes('verify')) {
+  if (
+    lower.includes('sha512')
+    || lower.includes('checksum')
+    || lower.includes('integrity')
+    || lower.includes('digest')
+  ) {
+    return {
+      code: 'INTEGRITY_VERIFICATION_FAILED',
+      message: 'Downloaded update failed SHA-512 integrity verification. Installation was aborted for your safety.',
+      recoverable: false
+    };
+  }
+
+  if (
+    lower.includes('signature')
+    || lower.includes('authenticode')
+    || lower.includes('not signed')
+    || lower.includes('publisher')
+    || lower.includes('verify')
+  ) {
     return {
       code: 'SIGNATURE_VERIFICATION_FAILED',
       message: 'Update package signature verification failed. Installation was aborted for your safety.',
@@ -56,7 +76,7 @@ function classifyUpdaterError(error) {
     };
   }
 
-  if (lower.includes('cancelled') || lower.includes('aborted')) {
+  if (lower.includes('cancelled') || lower.includes('canceled') || lower.includes('aborted')) {
     return {
       code: 'DOWNLOAD_INTERRUPTED',
       message: 'Update download was interrupted. You can safely retry the download.',
@@ -101,6 +121,7 @@ function createUpdaterController({
   autoCheckUpdates = true,
   autoDownloadUpdates = true,
   autoUpdater = null,
+  CancellationTokenClass = null,
   stateFilePath = null,
   logger = null,
   checkIntervalMs = DEFAULT_CHECK_INTERVAL_MS,
@@ -111,6 +132,8 @@ function createUpdaterController({
   let periodicTimer = null;
   let startupTimer = null;
   let isChecking = false;
+  let activeCancellationToken = null;
+  let errorHandledByEvent = false;
 
   const persisted = readUpdaterPersistence(stateFilePath);
   const unfinishedInstallVersion = persisted.pendingInstallVersion && persisted.pendingInstallVersion !== appVersion
@@ -137,6 +160,8 @@ function createUpdaterController({
     releaseName: null,
     releaseNotes: null,
     channel: channelConfig.channel,
+    updaterChannel: channelConfig.updaterChannel,
+    feedRepository: RELEASES_REPO_SLUG,
     autoCheckUpdates: Boolean(autoCheckUpdates),
     autoDownloadUpdates: Boolean(autoDownloadUpdates),
     progressPercent: 0,
@@ -169,6 +194,28 @@ function createUpdaterController({
     return { ...state };
   }
 
+  function recordError(error, context = 'updater') {
+    isChecking = false;
+    activeCancellationToken = null;
+    const classified = classifyUpdaterError(error);
+    logger?.error('updater', `${context}: ${classified.code}`, error instanceof Error ? error.message : String(error));
+    const nextRetries = state.retryCount + 1;
+    const verificationFailed = !classified.recoverable;
+    return emit({
+      status: 'error',
+      retryCount: nextRetries,
+      lastCheckedAt: new Date().toISOString(),
+      errorCode: classified.code,
+      recoveryRequired: verificationFailed || nextRetries >= 2,
+      recoveryMessage: verificationFailed
+        ? `${classified.message} Download a verified installer manually from ${RELEASES_REPO_SLUG}.`
+        : nextRetries >= 2
+          ? 'Automatic update failed multiple times. You can retry or download the Windows installer directly from GitHub Releases.'
+          : null,
+      message: classified.message
+    });
+  }
+
   function applyAutoUpdaterSettings() {
     if (!autoUpdater || !isPackaged) return;
     autoUpdater.channel = channelConfig.updaterChannel;
@@ -183,7 +230,8 @@ function createUpdaterController({
 
     autoUpdater.on('checking-for-update', () => {
       isChecking = true;
-      logger?.info('updater', `Checking ${channelConfig.channel} channel for updates`);
+      errorHandledByEvent = false;
+      logger?.info('updater', `Checking ${channelConfig.channel} (${channelConfig.updaterChannel}) channel on ${RELEASES_REPO_SLUG}`);
       emit({
         status: 'checking',
         errorCode: null,
@@ -217,6 +265,9 @@ function createUpdaterController({
         status: 'not-available',
         availableVersion: null,
         progressPercent: 0,
+        bytesPerSecond: 0,
+        transferredBytes: 0,
+        totalBytes: 0,
         retryCount: 0,
         lastCheckedAt: new Date().toISOString(),
         errorCode: null,
@@ -238,12 +289,14 @@ function createUpdaterController({
 
     autoUpdater.on('update-downloaded', info => {
       isChecking = false;
+      activeCancellationToken = null;
       const version = info?.version || state.availableVersion;
-      logger?.info('updater', 'Update downloaded and verified', { version });
+      logger?.info('updater', 'Update downloaded and integrity-verified', { version });
       emit({
         status: 'downloaded',
         availableVersion: version,
         progressPercent: 100,
+        bytesPerSecond: 0,
         retryCount: 0,
         recoveryRequired: false,
         recoveryMessage: null,
@@ -253,20 +306,8 @@ function createUpdaterController({
     });
 
     autoUpdater.on('error', error => {
-      isChecking = false;
-      const classified = classifyUpdaterError(error);
-      logger?.error('updater', classified.code, error instanceof Error ? error.message : String(error));
-      emit({
-        status: 'error',
-        retryCount: state.retryCount + 1,
-        lastCheckedAt: new Date().toISOString(),
-        errorCode: classified.code,
-        recoveryRequired: !classified.recoverable || state.retryCount + 1 >= 2,
-        recoveryMessage: !classified.recoverable
-          ? 'Automatic verification failed. Download a fresh signed installer from GitHub Releases.'
-          : null,
-        message: classified.message
-      });
+      errorHandledByEvent = true;
+      recordError(error, 'event');
     });
   }
 
@@ -310,6 +351,7 @@ function createUpdaterController({
 
     applyAutoUpdaterSettings();
     isChecking = true;
+    errorHandledByEvent = false;
     emit({
       status: 'checking',
       errorCode: null,
@@ -322,16 +364,10 @@ function createUpdaterController({
       await autoUpdater.checkForUpdates();
       return getState();
     } catch (error) {
-      isChecking = false;
-      const classified = classifyUpdaterError(error);
-      logger?.error('updater', `checkForUpdates failed: ${classified.code}`);
-      return emit({
-        status: 'error',
-        retryCount: state.retryCount + 1,
-        lastCheckedAt: new Date().toISOString(),
-        errorCode: classified.code,
-        message: classified.message
-      });
+      if (!errorHandledByEvent) {
+        return recordError(error, 'checkForUpdates');
+      }
+      return getState();
     }
   }
 
@@ -339,34 +375,60 @@ function createUpdaterController({
     if (!isPackaged || !autoUpdater) {
       return getState();
     }
-    if (state.errorCode === 'SIGNATURE_VERIFICATION_FAILED') {
+    if (
+      state.errorCode === 'SIGNATURE_VERIFICATION_FAILED'
+      || state.errorCode === 'INTEGRITY_VERIFICATION_FAILED'
+    ) {
       return getState();
     }
     if (state.status !== 'available' && state.status !== 'error' && state.status !== 'recovery') {
       return getState();
     }
+
+    errorHandledByEvent = false;
+    activeCancellationToken = typeof CancellationTokenClass === 'function'
+      ? new CancellationTokenClass()
+      : null;
+
     emit({
       status: 'downloading',
       progressPercent: 0,
+      bytesPerSecond: 0,
+      transferredBytes: 0,
+      totalBytes: 0,
       errorCode: null,
       recoveryRequired: false,
       recoveryMessage: null,
       message: 'Starting update download...'
     });
+
     try {
-      await autoUpdater.downloadUpdate();
+      if (activeCancellationToken) {
+        await autoUpdater.downloadUpdate(activeCancellationToken);
+      } else {
+        await autoUpdater.downloadUpdate();
+      }
       return getState();
     } catch (error) {
-      const classified = classifyUpdaterError(error);
-      logger?.error('updater', `downloadUpdate failed: ${classified.code}`);
+      if (!errorHandledByEvent) {
+        return recordError(error, 'downloadUpdate');
+      }
+      return getState();
+    }
+  }
+
+  function cancelDownload() {
+    if (activeCancellationToken && typeof activeCancellationToken.cancel === 'function') {
+      activeCancellationToken.cancel();
+      activeCancellationToken = null;
       return emit({
         status: 'error',
-        retryCount: state.retryCount + 1,
-        errorCode: classified.code,
-        recoveryRequired: !classified.recoverable || state.retryCount + 1 >= 2,
-        message: classified.message
+        errorCode: 'DOWNLOAD_INTERRUPTED',
+        bytesPerSecond: 0,
+        message: 'Update download cancelled. You can retry whenever you are ready.'
       });
     }
+    return getState();
   }
 
   function dismissRecovery() {
@@ -381,6 +443,7 @@ function createUpdaterController({
       recoveryRequired: false,
       recoveryMessage: null,
       errorCode: null,
+      retryCount: 0,
       message: isPackaged ? 'Recovery cleared. Ready to check for updates.' : 'Running in development mode.'
     });
   }
@@ -428,9 +491,22 @@ function createUpdaterController({
     const channelChanged = previousChannel !== channelConfig.channel;
     const nextPatch = {
       channel: channelConfig.channel,
+      updaterChannel: channelConfig.updaterChannel,
       autoCheckUpdates: nextAutoCheck !== undefined ? Boolean(nextAutoCheck) : state.autoCheckUpdates,
       autoDownloadUpdates: nextAutoDownload !== undefined ? Boolean(nextAutoDownload) : state.autoDownloadUpdates,
-      ...(channelChanged ? { availableVersion: null, progressPercent: 0, postponed: false } : {})
+      ...(channelChanged
+        ? {
+            status: isPackaged ? 'idle' : 'dev-mode',
+            availableVersion: null,
+            progressPercent: 0,
+            bytesPerSecond: 0,
+            postponed: false,
+            errorCode: null,
+            message: isPackaged
+              ? `Switched to ${channelConfig.channel} channel. Click Check for Updates to query ${RELEASES_REPO_SLUG}.`
+              : state.message
+          }
+        : {})
     };
     emit(nextPatch);
     applyAutoUpdaterSettings();
@@ -446,6 +522,10 @@ function createUpdaterController({
 
   function dispose() {
     clearTimers();
+    if (activeCancellationToken && typeof activeCancellationToken.cancel === 'function') {
+      activeCancellationToken.cancel();
+      activeCancellationToken = null;
+    }
   }
 
   return {
@@ -454,6 +534,7 @@ function createUpdaterController({
     getState,
     checkForUpdates,
     downloadUpdate,
+    cancelDownload,
     dismissRecovery,
     postponeInstall,
     installNow,
@@ -463,6 +544,7 @@ function createUpdaterController({
 
 module.exports = {
   DEFAULT_CHECK_INTERVAL_MS,
+  RELEASES_REPO_SLUG,
   RELEASES_FALLBACK_URL,
   resolveChannelConfig,
   classifyUpdaterError,

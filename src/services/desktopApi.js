@@ -153,6 +153,12 @@ export async function downloadAvailableUpdate() {
   return bridge.updater.download();
 }
 
+export async function cancelUpdateDownload() {
+  const bridge = getDesktopBridge();
+  if (!bridge?.updater?.cancelDownload) return null;
+  return bridge.updater.cancelDownload();
+}
+
 export async function dismissUpdaterRecovery() {
   const bridge = getDesktopBridge();
   if (!bridge?.updater?.dismissRecovery) return null;

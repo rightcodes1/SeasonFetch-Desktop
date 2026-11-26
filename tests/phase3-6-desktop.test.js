@@ -100,7 +100,8 @@ test('apiBridge retries transient 503 for idempotent GET requests once, and neve
   assert.equal(postCalls, 1);
 });
 
-test('updaterService detects unfinished updates on restart and supports dismissing recovery', () => {
+test('updaterService detects unfinished updates on restart, points to public releases repo, handles integrity failures, and supports download cancellation', async () => {
+  const { EventEmitter } = await import('node:events');
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sf-updater-state-'));
   const stateFilePath = path.join(tmpDir, 'updater-state.json');
 
@@ -116,6 +117,8 @@ test('updaterService detects unfinished updates on restart and supports dismissi
       isPackaged: true,
       stateFilePath
     });
+    assert.equal(controller.getState().feedRepository, 'rightcodes1/SeasonFetch-Desktop-Releases');
+    assert.equal(controller.getState().releasesUrl, 'https://github.com/rightcodes1/SeasonFetch-Desktop-Releases/releases');
     assert.equal(controller.getState().status, 'recovery');
     assert.equal(controller.getState().recoveryRequired, true);
     assert.match(controller.getState().recoveryMessage, /0\.2\.0/);
@@ -123,6 +126,52 @@ test('updaterService detects unfinished updates on restart and supports dismissi
     controller.dismissRecovery();
     assert.equal(controller.getState().recoveryRequired, false);
     assert.equal(controller.getState().status, 'idle');
+
+    // Deduplicate error counting when electron-updater emits 'error' AND rejects checkForUpdates()
+    const mockUpdater = new EventEmitter();
+    mockUpdater.checkForUpdates = async () => {
+      const err = new Error('sha512 checksum mismatch');
+      mockUpdater.emit('error', err);
+      throw err;
+    };
+
+    const strictController = createUpdaterController({
+      appVersion: '0.1.0',
+      isPackaged: true,
+      autoCheckUpdates: false,
+      autoUpdater: mockUpdater
+    });
+    strictController.start();
+    await strictController.checkForUpdates({ reason: 'manual' });
+    assert.equal(strictController.getState().retryCount, 1);
+    assert.equal(strictController.getState().errorCode, 'INTEGRITY_VERIFICATION_FAILED');
+    assert.equal(strictController.getState().recoveryRequired, true);
+
+    // Download cancellation via CancellationToken
+    let cancelled = false;
+    class MockCancellationToken {
+      cancel() {
+        cancelled = true;
+      }
+    }
+    const dlUpdater = new EventEmitter();
+    dlUpdater.downloadUpdate = () => new Promise(() => {});
+    const dlController = createUpdaterController({
+      appVersion: '0.1.0',
+      isPackaged: true,
+      autoCheckUpdates: false,
+      autoDownloadUpdates: false,
+      autoUpdater: dlUpdater,
+      CancellationTokenClass: MockCancellationToken
+    });
+    dlController.start();
+    dlUpdater.emit('update-available', { version: '0.1.1' });
+    dlController.downloadUpdate();
+    dlController.cancelDownload();
+    assert.equal(cancelled, true);
+    assert.equal(dlController.getState().errorCode, 'DOWNLOAD_INTERRUPTED');
+    strictController.dispose();
+    dlController.dispose();
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }

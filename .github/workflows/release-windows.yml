@@ -6,23 +6,27 @@ on:
       - 'v*'
   workflow_dispatch:
     inputs:
-      channel:
-        description: 'Release channel (stable or preview)'
+      publish_release:
+        description: 'Publish to rightcodes1/SeasonFetch-Desktop-Releases (leave unchecked for dry-run build)'
         required: true
-        default: 'preview'
-        type: choice
-        options:
-          - preview
-          - stable
+        default: false
+        type: boolean
+      release_notes_summary:
+        description: 'Optional short summary prepended to the GitHub Release notes'
+        required: false
+        default: ''
+        type: string
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  build-windows:
+  build-and-release-windows:
     runs-on: windows-latest
+    env:
+      RELEASES_REPO: rightcodes1/SeasonFetch-Desktop-Releases
     steps:
-      - name: Checkout SeasonFetch-Desktop
+      - name: Checkout private SeasonFetch-Desktop source
         uses: actions/checkout@v4
 
       - name: Setup Node.js
@@ -31,10 +35,76 @@ jobs:
           node-version: 24
           cache: npm
 
+      - name: Determine release intent, version, and channel
+        id: meta
+        shell: pwsh
+        run: |
+          $pkg = Get-Content package.json -Raw | ConvertFrom-Json
+          $version = [string]$pkg.version
+          $isTag = "${{ github.ref_type }}" -eq "tag"
+          $manualPublish = "${{ inputs.publish_release }}" -eq "true"
+          $shouldPublish = $isTag -or $manualPublish
+
+          if ($isTag) {
+            $tagName = "${{ github.ref_name }}"
+            if ($tagName -ne "v$version") {
+              Write-Error "Tag '$tagName' does not match package.json version 'v$version'. Bump package.json before tagging."
+              exit 1
+            }
+          } else {
+            $tagName = "v$version"
+          }
+
+          if ($version -match '-beta\.\d+$') {
+            $channel = "preview"
+            $metadataFile = "beta.yml"
+            $isPrerelease = "true"
+          } elseif ($version -match '^\d+\.\d+\.\d+$') {
+            $channel = "stable"
+            $metadataFile = "latest.yml"
+            $isPrerelease = "false"
+          } else {
+            Write-Error "Unsupported version format '$version'. Use X.Y.Z for Stable or X.Y.Z-beta.N for Preview."
+            exit 1
+          }
+
+          echo "version=$version" >> $env:GITHUB_OUTPUT
+          echo "tag=$tagName" >> $env:GITHUB_OUTPUT
+          echo "channel=$channel" >> $env:GITHUB_OUTPUT
+          echo "metadata_file=$metadataFile" >> $env:GITHUB_OUTPUT
+          echo "is_prerelease=$isPrerelease" >> $env:GITHUB_OUTPUT
+          echo "should_publish=$($shouldPublish.ToString().ToLower())" >> $env:GITHUB_OUTPUT
+          Write-Host "Resolved build: SeasonFetch Desktop $tagName | channel=$channel ($metadataFile) | publish=$shouldPublish"
+
+      - name: Validate required build variables and publishing secrets
+        shell: pwsh
+        env:
+          VITE_SUPABASE_URL: ${{ vars.VITE_SUPABASE_URL || secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_PUBLISHABLE_KEY: ${{ vars.VITE_SUPABASE_PUBLISHABLE_KEY || secrets.VITE_SUPABASE_PUBLISHABLE_KEY }}
+          RELEASES_REPO_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
+          WIN_CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
+          WIN_CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
+        run: |
+          $missing = @()
+          if ([string]::IsNullOrWhiteSpace($env:VITE_SUPABASE_URL)) { $missing += "VITE_SUPABASE_URL (Repository Variable)" }
+          if ([string]::IsNullOrWhiteSpace($env:VITE_SUPABASE_PUBLISHABLE_KEY)) { $missing += "VITE_SUPABASE_PUBLISHABLE_KEY (Repository Variable)" }
+          if ("${{ steps.meta.outputs.should_publish }}" -eq "true" -and [string]::IsNullOrWhiteSpace($env:RELEASES_REPO_TOKEN)) {
+            $missing += "RELEASES_REPO_TOKEN (Repository Secret scoped to rightcodes1/SeasonFetch-Desktop-Releases Contents: Write)"
+          }
+          if ($missing.Count -gt 0) {
+            Write-Error ("Missing required release configuration:`n  - " + ($missing -join "`n  - "))
+            exit 1
+          }
+          if ([string]::IsNullOrWhiteSpace($env:WIN_CSC_LINK)) {
+            Write-Warning "WIN_CSC_LINK is not configured. Windows installer will be built UNSIGNED (SHA-512 verification still enforced; Windows SmartScreen will warn)."
+          } else {
+            Write-Host "Authenticode signing credentials detected."
+          }
+
       - name: Install dependencies
         run: npm ci
 
-      - name: Release preflight verification
+      - name: Run release preflight verification
         run: node scripts/release-check.mjs
 
       - name: Run desktop unit tests
@@ -46,51 +116,138 @@ jobs:
           VITE_SUPABASE_PUBLISHABLE_KEY: ${{ vars.VITE_SUPABASE_PUBLISHABLE_KEY || secrets.VITE_SUPABASE_PUBLISHABLE_KEY }}
         run: npm run build:renderer
 
-      - name: Determine release channel
-        id: channel
-        shell: pwsh
-        run: |
-          $tag = "${{ github.ref_name }}"
-          if ($tag -match '-(preview|beta|alpha|rc)') {
-            echo "channel=beta" >> $env:GITHUB_OUTPUT
-            echo "is_prerelease=true" >> $env:GITHUB_OUTPUT
-          } elseif ("${{ inputs.channel }}" -eq "preview") {
-            echo "channel=beta" >> $env:GITHUB_OUTPUT
-            echo "is_prerelease=true" >> $env:GITHUB_OUTPUT
-          } else {
-            echo "channel=latest" >> $env:GITHUB_OUTPUT
-            echo "is_prerelease=false" >> $env:GITHUB_OUTPUT
-          }
-
-      - name: Build Windows NSIS installer and updater metadata
+      - name: Package Windows NSIS installer and updater metadata
         shell: pwsh
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           WIN_CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
           WIN_CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
         run: |
-          if ("${{ github.ref_type }}" -eq "tag") {
-            npx electron-builder --win nsis --publish always -c.generateUpdatesFilesForAllChannels=true
-          } else {
-            npx electron-builder --win nsis --publish never -c.generateUpdatesFilesForAllChannels=true
-          }
+          npx electron-builder --win nsis --publish never
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Generate SHA-256 checksums
+      - name: Verify generated artifacts, SHA-512 metadata, and SHA256SUMS.txt
         shell: pwsh
         run: |
-          Get-ChildItem release\*.exe, release\*.blockmap, release\*.yml -ErrorAction SilentlyContinue |
-            ForEach-Object {
-              $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
-              "$hash  $($_.Name)"
-            } | Set-Content -Path release\SHA256SUMS.txt -Encoding UTF8
+          $version = "${{ steps.meta.outputs.version }}"
+          $metaFile = "${{ steps.meta.outputs.metadata_file }}"
+          $exeName = "SeasonFetch-Setup-$version.exe"
+          $blockmapName = "$exeName.blockmap"
 
-      - name: Upload build artifacts
+          $required = @($exeName, $blockmapName, $metaFile)
+          foreach ($name in $required) {
+            $full = Join-Path "release" $name
+            if (-not (Test-Path $full)) {
+              Write-Error "Expected release artifact is missing: $full"
+              Get-ChildItem release | Format-Table Name, Length
+              exit 1
+            }
+          }
+
+          # Verify SHA-512 in update metadata matches the packaged installer byte-for-byte
+          $sha512 = [System.Security.Cryptography.SHA512]::Create()
+          $stream = [System.IO.File]::OpenRead((Join-Path "release" $exeName))
+          $computedB64 = [Convert]::ToBase64String($sha512.ComputeHash($stream))
+          $stream.Dispose()
+          $sha512.Dispose()
+
+          $ymlContent = Get-Content (Join-Path "release" $metaFile) -Raw
+          if (-not $ymlContent.Contains($computedB64)) {
+            Write-Error "Integrity error: $metaFile SHA-512 digest does not match $exeName."
+            exit 1
+          }
+
+          # Generate SHA256SUMS.txt
+          $checksumLines = foreach ($name in $required) {
+            $hash = (Get-FileHash (Join-Path "release" $name) -Algorithm SHA256).Hash.ToLower()
+            "$hash  $name"
+          }
+          $checksumLines | Set-Content -Path "release\SHA256SUMS.txt" -Encoding UTF8
+          Write-Host "Verified all release artifacts and generated SHA256SUMS.txt:"
+          Get-Content "release\SHA256SUMS.txt"
+
+      - name: Upload workflow build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: seasonfetch-windows-${{ steps.channel.outputs.channel }}
+          name: seasonfetch-windows-${{ steps.meta.outputs.tag }}-${{ steps.meta.outputs.channel }}
           path: |
-            release/*.exe
-            release/*.blockmap
+            release/SeasonFetch-Setup-*.exe
+            release/SeasonFetch-Setup-*.exe.blockmap
             release/*.yml
             release/SHA256SUMS.txt
+            !release/builder-debug.yml
           retention-days: 14
+
+      - name: Publish release artifacts to public SeasonFetch-Desktop-Releases repository
+        if: steps.meta.outputs.should_publish == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
+          WIN_CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
+        run: |
+          $repo = $env:RELEASES_REPO
+          $tag = "${{ steps.meta.outputs.tag }}"
+          $version = "${{ steps.meta.outputs.version }}"
+          $channel = "${{ steps.meta.outputs.channel }}"
+          $metaFile = "${{ steps.meta.outputs.metadata_file }}"
+          $isPrerelease = "${{ steps.meta.outputs.is_prerelease }}" -eq "true"
+          $exePath = "release\SeasonFetch-Setup-$version.exe"
+          $blockmapPath = "release\SeasonFetch-Setup-$version.exe.blockmap"
+          $metaPath = "release\$metaFile"
+          $sumsPath = "release\SHA256SUMS.txt"
+
+          # Verify target public releases repository exists and is reachable
+          gh api "repos/$repo" --silent
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Cannot access $repo with RELEASES_REPO_TOKEN. Ensure the public repository exists, has an initial commit (README), and RELEASES_REPO_TOKEN grants Contents: Write."
+            exit 1
+          }
+
+          $signedStatus = if ([string]::IsNullOrWhiteSpace($env:WIN_CSC_LINK)) {
+            "Unsigned Windows build (SHA-512 integrity verified by updater; Authenticode certificate pending)"
+          } else {
+            "Authenticode signed + SHA-512 integrity verified"
+          }
+
+          $customSummary = "${{ inputs.release_notes_summary }}"
+          $summaryBlock = if ([string]::IsNullOrWhiteSpace($customSummary)) { "" } else { "$customSummary`n`n" }
+          $sumsContent = Get-Content $sumsPath -Raw
+
+          $notes = @(
+            "# SeasonFetch Desktop $tag",
+            "",
+            $summaryBlock.TrimEnd(),
+            "**Channel:** $channel (``$metaFile``)",
+            "**Signing status:** $signedStatus",
+            "**Source commit:** ``${{ github.sha }}`` (private repository)",
+            "",
+            "## Windows Installer",
+            "Download and run ``SeasonFetch-Setup-$version.exe``. Existing installations on the **$channel** channel receive this update automatically.",
+            "",
+            "## SHA-256 Checksums",
+            '```text',
+            $sumsContent.Trim(),
+            '```'
+          ) -join "`n"
+          $notes | Set-Content -Path "release\RELEASE_NOTES.md" -Encoding UTF8
+
+          # Reject duplicate release tag rather than silently overwriting published binaries
+          gh release view $tag --repo $repo *> $null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Error "Release '$tag' already exists in $repo. Bump package.json version and create a new tag instead of overwriting published artifacts."
+            exit 1
+          }
+
+          $releaseArgs = @(
+            "release", "create", $tag,
+            $exePath, $blockmapPath, $metaPath, $sumsPath,
+            "--repo", $repo,
+            "--title", "SeasonFetch Desktop $tag",
+            "--notes-file", "release\RELEASE_NOTES.md"
+          )
+          if ($isPrerelease) {
+            $releaseArgs += "--prerelease"
+          }
+
+          gh @releaseArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Host "Published $tag to https://github.com/$repo/releases/tag/$tag"

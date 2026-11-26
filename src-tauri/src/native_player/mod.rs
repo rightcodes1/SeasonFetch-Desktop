@@ -131,44 +131,48 @@ impl NativePlaybackManager {
             };
         }
 
-        // Ensure Win32 embedded child surface exists underneath transparent WebView2
+        // Match Stremio v5 (stremio-shell-ng) and tauri-plugin-libmpv:
+        // Attach libmpv directly to the top-level Tauri window HWND so its D3D11 swapchain
+        // composites cleanly behind transparent WebView2 without sibling WS_CLIPSIBLINGS clipping.
         #[cfg(windows)]
         let wid_hwnd = {
-            if inner.surface.is_none() {
-                let Some(win) = app.get_webview_window("main") else {
+            let Some(win) = app.get_webview_window("main") else {
+                return NativeEngineActionResult {
+                    ok: false,
+                    engine: chosen.to_string(),
+                    error: Some("Main Tauri window is unavailable.".to_string()),
+                    state: None,
+                };
+            };
+            let parent_hwnd = match win.hwnd() {
+                Ok(h) => h.0 as isize,
+                Err(err) => {
                     return NativeEngineActionResult {
                         ok: false,
                         engine: chosen.to_string(),
-                        error: Some("Main Tauri window is unavailable.".to_string()),
+                        error: Some(format!("Failed to acquire Win32 HWND: {err}")),
                         state: None,
                     };
-                };
-                let parent_hwnd = match win.hwnd() {
-                    Ok(h) => h.0 as isize,
-                    Err(err) => {
-                        return NativeEngineActionResult {
-                            ok: false,
-                            engine: chosen.to_string(),
-                            error: Some(format!("Failed to acquire Win32 HWND: {err}")),
-                            state: None,
-                        };
-                    }
-                };
-                match Win32VideoSurface::create(parent_hwnd) {
-                    Ok(s) => inner.surface = Some(s),
-                    Err(err) => {
-                        return NativeEngineActionResult {
-                            ok: false,
-                            engine: chosen.to_string(),
-                            error: Some(err),
-                            state: None,
-                        };
+                }
+            };
+            if chosen == "embedded-libvlc" {
+                if inner.surface.is_none() {
+                    if let Ok(s) = Win32VideoSurface::create(parent_hwnd) {
+                        inner.surface = Some(s);
                     }
                 }
+                if let Some(surface) = inner.surface.as_ref() {
+                    surface.show_and_fit();
+                    surface.raw_hwnd()
+                } else {
+                    parent_hwnd
+                }
+            } else {
+                if let Some(surface) = inner.surface.as_ref() {
+                    surface.hide();
+                }
+                parent_hwnd
             }
-            let surface = inner.surface.as_ref().unwrap();
-            surface.show_and_fit();
-            surface.raw_hwnd()
         };
 
         #[cfg(not(windows))]

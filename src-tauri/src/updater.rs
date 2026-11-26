@@ -352,10 +352,10 @@ impl UpdaterManager {
                         "Update signature verification failed. Installation aborted for your safety.",
                         false,
                     )
-                } else if lower.contains("404") {
+                } else if lower.contains("404") || lower.contains("valid release json") {
                     (
                         "NO_RELEASE_METADATA",
-                        "No Tauri release manifest (latest.json / beta.json) is published on this channel yet.",
+                        "No release is published on this channel yet.",
                         true,
                     )
                 } else {

@@ -333,55 +333,52 @@ export function SettingsView({
           )}
 
           {currentId === 'player' && (
-            <div className="sf-panel">
-              <h2>Native Media Player &amp; Engines</h2>
-              <div className="sf-setting-row">
+            <div className="sf-panel sf-player-settings">
+              <div className="sf-panel-head">
                 <div>
-                  <strong>Preferred Playback Engine</strong>
-                  <p className="sf-muted-sm">
-                    Active default: <strong>{playerBackend?.activeDefaultEngine || 'embedded-libmpv'}</strong>
-                    {playerBackend?.libmpvAvailable ? ` · ${playerBackend.libmpvVersion || 'libmpv-2.dll ready'}` : ' · libmpv-2.dll missing'}
-                    {playerBackend?.libvlcAvailable ? ` · ${playerBackend.libvlcVersion || 'libVLC detected'}` : ''}
-                  </p>
+                  <h2>Player</h2>
+                  <p className="sf-muted-sm">Native Windows playback engines, hardware decoding, and subtitle defaults.</p>
+                </div>
+                <div className="sf-pill-row">
+                  <span className={`sf-engine-pill ${playerBackend?.libmpvAvailable ? 'is-ready' : ''}`}>
+                    libmpv {playerBackend?.libmpvAvailable ? 'Ready' : 'Missing'}
+                  </span>
+                  <span className={`sf-engine-pill ${playerBackend?.libvlcAvailable ? 'is-ready' : ''}`}>
+                    libVLC {playerBackend?.libvlcAvailable ? 'Ready' : 'Not installed'}
+                  </span>
+                </div>
+              </div>
+
+              <div className="sf-setting-group-label">ENGINE &amp; DECODING</div>
+
+              <div className="sf-setting-row">
+                <div className="sf-setting-copy">
+                  <strong>Playback Engine</strong>
+                  <p className="sf-muted-sm">Embedded libmpv is recommended for MKV, HEVC, AC3/DTS, and styled anime subtitles.</p>
                 </div>
                 <select
-                  className="sf-select"
+                  className="sf-select sf-setting-control"
                   value={player.preferredEngine || 'auto'}
                   onChange={e => patchPlayer({ preferredEngine: e.target.value })}
                 >
-                  <option value="auto">Auto (Embedded libmpv → libVLC → WebView2)</option>
+                  <option value="auto">Auto (Embedded libmpv)</option>
                   <option value="embedded-libmpv" disabled={!playerBackend?.libmpvAvailable}>
-                    Embedded libmpv — Primary (MKV/HEVC/AC3/DTS + libass)
+                    Embedded libmpv (Primary)
                   </option>
                   <option value="embedded-libvlc" disabled={!playerBackend?.libvlcAvailable}>
-                    Embedded libVLC — Optional (System VLC {playerBackend?.libvlcAvailable ? 'Installed' : 'Not Found'})
+                    Embedded libVLC (System VLC)
                   </option>
-                  <option value="webview">WebView2 HTML5 (Basic MP4/WebM Fallback)</option>
+                  <option value="webview">WebView2 HTML5 (Fallback)</option>
                   <option value="external-mpv" disabled={!playerBackend?.mpvAvailable}>
-                    External MPV Window ({playerBackend?.mpvAvailable ? 'Detected' : 'Not Installed'})
+                    External MPV Window
                   </option>
                 </select>
               </div>
 
-              {Array.isArray(playerBackend?.engines) && playerBackend.engines.length > 0 && (
-                <div className="sf-engine-grid">
-                  {playerBackend.engines.map(eng => (
-                    <div key={eng.id} className={`sf-engine-card ${eng.available ? 'is-ready' : 'is-missing'}`}>
-                      <div className="sf-engine-card-top">
-                        <strong>{eng.name}</strong>
-                        <span className="sf-mini-tag">{eng.available ? 'Ready' : 'Unavailable'}</span>
-                      </div>
-                      <p className="sf-muted-sm">{eng.detail}</p>
-                      <p className="sf-mono-sm">{eng.licenseNote}</p>
-                    </div>
-                  ))}
-                </div>
-              )}
-
               <div className="sf-setting-row">
-                <div>
-                  <strong>Hardware Video Decoding (D3D11VA)</strong>
-                  <p className="sf-muted-sm">Uses Windows D3D11VA hardware acceleration inside embedded libmpv with automatic software fallback.</p>
+                <div className="sf-setting-copy">
+                  <strong>Hardware Decoding (D3D11VA)</strong>
+                  <p className="sf-muted-sm">GPU-accelerated decoding with automatic software fallback.</p>
                 </div>
                 <input
                   type="checkbox"
@@ -391,52 +388,12 @@ export function SettingsView({
               </div>
 
               <div className="sf-setting-row">
-                <div>
-                  <strong>Local Torrent Streaming Bridge</strong>
-                  <p className="sf-muted-sm">
-                    {streamingStatus?.stremioServiceReachable
-                      ? `Connected on ${streamingStatus.stremioServiceOrigin}`
-                      : 'Not running on 127.0.0.1:11470 (Local files & direct HTTP/HTTPS play in-app; magnets hand off externally)'}
-                  </p>
-                </div>
-                <button type="button" className="sf-ghost-btn sf-sm" onClick={onRefreshPlayerStatus}>
-                  Re-probe
-                </button>
-              </div>
-
-              <div className="sf-setting-row">
-                <div>
-                  <strong>Preserve ASS/SSA Styled Subtitles (Native libass)</strong>
-                  <p className="sf-muted-sm">Renders full anime typesetting, fonts, alignments, karaoke, and multi-line ASS/SSA via libass.</p>
-                </div>
-                <input
-                  type="checkbox"
-                  checked={Boolean(player.preferAssStyling ?? true)}
-                  onChange={e => patchPlayer({ preferAssStyling: e.target.checked })}
-                />
-              </div>
-
-              <div className="sf-setting-row">
-                <div>
-                  <strong>Subtitle Vertical Position ({player.subtitleVerticalPos ?? 92}%)</strong>
-                  <p className="sf-muted-sm">Default vertical height of rendered subtitles inside libmpv.</p>
-                </div>
-                <input
-                  type="range"
-                  min="15"
-                  max="96"
-                  value={player.subtitleVerticalPos ?? 92}
-                  onChange={e => patchPlayer({ subtitleVerticalPos: Number(e.target.value) })}
-                />
-              </div>
-
-              <div className="sf-setting-row">
-                <div>
-                  <strong>Remembered Playback Speed ({player.playbackSpeed ?? 1}x)</strong>
-                  <p className="sf-muted-sm">Restored automatically across sessions.</p>
+                <div className="sf-setting-copy">
+                  <strong>Default Playback Speed</strong>
+                  <p className="sf-muted-sm">Remembered automatically across sessions.</p>
                 </div>
                 <select
-                  className="sf-select"
+                  className="sf-select sf-sm"
                   value={player.playbackSpeed ?? 1}
                   onChange={e => patchPlayer({ playbackSpeed: Number(e.target.value) })}
                 >
@@ -446,16 +403,63 @@ export function SettingsView({
                 </select>
               </div>
 
+              <div className="sf-setting-group-label">SUBTITLES</div>
+
               <div className="sf-setting-row">
-                <div>
-                  <strong>Custom External MPV Executable Path (Optional)</strong>
-                  <p className="sf-muted-sm">Only needed if you want to hand off playback to an external mpv.exe window.</p>
+                <div className="sf-setting-copy">
+                  <strong>Preserve ASS/SSA Styling (libass)</strong>
+                  <p className="sf-muted-sm">Keep original anime typesetting, fonts, colors, and positioning.</p>
                 </div>
                 <input
-                  className="sf-input"
+                  type="checkbox"
+                  checked={Boolean(player.preferAssStyling ?? true)}
+                  onChange={e => patchPlayer({ preferAssStyling: e.target.checked })}
+                />
+              </div>
+
+              <div className="sf-setting-row">
+                <div className="sf-setting-copy">
+                  <strong>Subtitle Vertical Position</strong>
+                  <p className="sf-muted-sm">Height from top of frame ({player.subtitleVerticalPos ?? 92}%).</p>
+                </div>
+                <div className="sf-range-inline">
+                  <input
+                    type="range"
+                    min="15"
+                    max="96"
+                    value={player.subtitleVerticalPos ?? 92}
+                    onChange={e => patchPlayer({ subtitleVerticalPos: Number(e.target.value) })}
+                  />
+                  <span className="sf-mono-sm">{player.subtitleVerticalPos ?? 92}%</span>
+                </div>
+              </div>
+
+              <div className="sf-setting-group-label">STREAMING &amp; EXTERNAL</div>
+
+              <div className="sf-setting-row">
+                <div className="sf-setting-copy">
+                  <strong>Local Torrent Bridge</strong>
+                  <p className="sf-muted-sm">
+                    {streamingStatus?.stremioServiceReachable
+                      ? `Connected on ${streamingStatus.stremioServiceOrigin}`
+                      : 'Not running on 127.0.0.1:11470'}
+                  </p>
+                </div>
+                <button type="button" className="sf-ghost-btn sf-sm" onClick={onRefreshPlayerStatus}>
+                  Re-check
+                </button>
+              </div>
+
+              <div className="sf-setting-row">
+                <div className="sf-setting-copy">
+                  <strong>External MPV Path (Optional)</strong>
+                  <p className="sf-muted-sm">Only needed if launching an external mpv.exe window.</p>
+                </div>
+                <input
+                  className="sf-input sf-setting-control"
                   type="text"
                   value={player.mpvExecutablePath || ''}
-                  placeholder="C:\Program Files\mpv\mpv.exe"
+                  placeholder="Auto-detected if installed"
                   onChange={e => patchPlayer({ mpvExecutablePath: e.target.value })}
                 />
               </div>

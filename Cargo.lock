@@ -4557,7 +4557,7 @@ dependencies = [
 
 [[package]]
 name = "seasonfetch-desktop"
-version = "0.1.1-beta.5"
+version = "0.1.1-beta.6"
 dependencies = [
  "base64 0.22.1",
  "chrono",

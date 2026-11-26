@@ -122,7 +122,7 @@ export function PlayerOverlay({
   );
   const isExternalMode = activeEngine === 'external-player';
   const isNativeEngine = activeEngine === 'embedded-libmpv' || activeEngine === 'embedded-libvlc';
-  const [externalLaunched, setExternalLaunched] = useState(false);
+  const [externalLaunchedName, setExternalLaunchedName] = useState('');
 
   // Sync activeEngine if playerBackend finished loading after mount
   useEffect(() => {
@@ -201,7 +201,7 @@ export function PlayerOverlay({
     let cancelled = false;
     torrentStoppedRef.current = false;
     externalLaunchedUrlRef.current = null;
-    setExternalLaunched(false);
+    setExternalLaunchedName('');
     setResolvedTorrentUrl(null);
     setVideoError('');
     setBuffering(true);
@@ -268,7 +268,7 @@ export function PlayerOverlay({
       executablePath: playerPrefs?.externalPlayerPath || null
     }).then(res => {
       if (res?.ok) {
-        setExternalLaunched(true);
+        setExternalLaunchedName(res.engine || 'external player');
         onToast?.(`Launched stream in ${res.engine}`);
       } else {
         setVideoError(res?.error || 'Could not launch configured external player.');
@@ -680,6 +680,7 @@ export function PlayerOverlay({
           subtitleFile: subFilePath
         });
     if (res?.ok) {
+      setExternalLaunchedName(res.engine || 'external player');
       onToast?.(`Opened in ${res.engine || 'external player'}`);
     } else {
       onToast?.(res?.error || 'External player could not be launched.');

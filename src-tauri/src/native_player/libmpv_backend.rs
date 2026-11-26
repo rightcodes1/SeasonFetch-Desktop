@@ -465,10 +465,13 @@ impl EmbeddedLibMpv {
                 let _ = syms.set_opt_str(ctx, "cache", "yes");
                 let _ = syms.set_opt_str(ctx, "cache-pause", "yes");
                 let _ = syms.set_opt_str(ctx, "cache-pause-initial", "yes");
-                let _ = syms.set_opt_str(ctx, "cache-pause-wait", "2");
+                let _ = syms.set_opt_str(ctx, "cache-pause-wait", "0.5");
                 let _ = syms.set_opt_str(ctx, "network-timeout", "60");
                 let _ = syms.set_opt_str(ctx, "demuxer-max-bytes", "150MiB");
-                let _ = syms.set_opt_str(ctx, "demuxer-readahead-secs", "20");
+                let _ = syms.set_opt_str(ctx, "demuxer-readahead-secs", "15");
+                let _ = syms.set_opt_str(ctx, "demuxer-mkv-probe-start-time", "no");
+                let _ = syms.set_opt_str(ctx, "demuxer-lavf-probesize", "1048576");
+                let _ = syms.set_opt_str(ctx, "demuxer-lavf-analyzeduration", "1");
                 let _ = syms.set_opt_str(
                     ctx,
                     "demuxer-lavf-o",

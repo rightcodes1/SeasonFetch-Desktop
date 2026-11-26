@@ -217,8 +217,8 @@ impl TorrentStreamingEngine {
             fastresume: false,
             default_storage_factory: Some(self.inner.storage_factory.clone().boxed()),
             peer_opts: Some(PeerConnectionOptions {
-                connect_timeout: Some(Duration::from_secs(8)),
-                read_write_timeout: Some(Duration::from_secs(25)),
+                connect_timeout: Some(Duration::from_secs(5)),
+                read_write_timeout: Some(Duration::from_secs(12)),
                 ..Default::default()
             }),
             ..Default::default()
@@ -582,14 +582,15 @@ impl TorrentStreamingEngine {
 
         let (cancel_tx, _) = watch::channel(false);
 
-        // Head-first prioritization, THEN tail pre-warm:
-        // 1. Immediately register a stream at byte 0 so `librqbit` concentrates peer requests on
-        //    the very first piece of the selected file (never starving byte 0 behind the tail).
-        // 2. Only after the opening bytes at offset 0 are readable, briefly pre-warm the container
-        //    tail (last ~1 MiB where MKV Cues / MP4 moov often live) so seeking is instant too.
+        // Stremio-style parallel head + tail pre-warm from T=0:
+        // MKV (Matroska `Cues`) and MP4 (`moov`) players probe byte 0 AND immediately seek to
+        // the final ~64 KiB before presenting frame 1. Opening both FileStreams concurrently lets
+        // `librqbit::TorrentStreams::iter_next_pieces` interleave Piece 0 and the tail piece from
+        // the very first millisecond peers connect — cutting startup wait roughly in half.
         let prewarm_task = {
             let handle_pw = Arc::clone(&handle);
-            let mut cancel_pw = cancel_tx.subscribe();
+            let cancel_head = cancel_tx.subscribe();
+            let cancel_tail = cancel_tx.subscribe();
             let tail_offset = if file_len > 2 * 1024 * 1024 {
                 Some(file_len.saturating_sub(64 * 1024))
             } else {
@@ -597,31 +598,35 @@ impl TorrentStreamingEngine {
             };
             Some(tokio::spawn(async move {
                 use tokio::io::{AsyncReadExt, AsyncSeekExt};
-                let head_ok = if let Ok(mut head_stream) = handle_pw.clone().stream(selected_idx) {
-                    let mut buf = [0u8; 4096];
-                    tokio::select! {
-                        _ = cancel_pw.changed() => false,
-                        res = tokio::time::timeout(Duration::from_secs(60), head_stream.read(&mut buf)) => {
-                            matches!(res, Ok(Ok(n)) if n > 0)
-                        }
+
+                let head_handle = Arc::clone(&handle_pw);
+                let head_fut = async move {
+                    let mut cancel = cancel_head;
+                    if let Ok(mut head_stream) = head_handle.stream(selected_idx) {
+                        let mut buf = [0u8; 4096];
+                        let _ = tokio::select! {
+                            _ = cancel.changed() => {}
+                            _ = tokio::time::timeout(Duration::from_secs(60), head_stream.read(&mut buf)) => {}
+                        };
                     }
-                } else {
-                    false
                 };
 
-                if head_ok {
+                let tail_fut = async move {
+                    let mut cancel = cancel_tail;
                     if let Some(tail_pos) = tail_offset {
                         if let Ok(mut tail_stream) = handle_pw.stream(selected_idx) {
                             if tail_stream.seek(std::io::SeekFrom::Start(tail_pos)).await.is_ok() {
                                 let mut buf = [0u8; 4096];
                                 let _ = tokio::select! {
-                                    _ = cancel_pw.changed() => {}
-                                    _ = tokio::time::timeout(Duration::from_secs(20), tail_stream.read(&mut buf)) => {}
+                                    _ = cancel.changed() => {}
+                                    _ = tokio::time::timeout(Duration::from_secs(60), tail_stream.read(&mut buf)) => {}
                                 };
                             }
                         }
                     }
-                }
+                };
+
+                tokio::join!(head_fut, tail_fut);
             }))
         };
 

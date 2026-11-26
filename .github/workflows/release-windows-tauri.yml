@@ -130,6 +130,12 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
+          if ("${{ steps.meta.outputs.channel }}" -eq "preview") {
+            Write-Host "Preview channel detected — enabling fast parallel release codegen for quicker CI builds."
+            $env:CARGO_PROFILE_RELEASE_OPT_LEVEL = "2"
+            $env:CARGO_PROFILE_RELEASE_LTO = "false"
+            $env:CARGO_PROFILE_RELEASE_CODEGEN_UNITS = "16"
+          }
           if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) {
             Write-Host "No TAURI_SIGNING_PRIVATE_KEY set (dry-run mode) — building unsigned NSIS bundle."
             $cfgPath = Join-Path $env:RUNNER_TEMP "tauri-dryrun.json"

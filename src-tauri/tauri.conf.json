@@ -53,7 +53,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDkyRjg3QkYxMDFBMEU1RTcKUldUbjVhQUI4WHY0a3J0cDZPODZRS3k1Zm5PcHZaVitGaGNEQ1dIVHdmQ1B4T1E1SGZ3QnJCM2YK",
       "endpoints": [
         "https://github.com/rightcodes1/SeasonFetch-Desktop-Releases/releases/latest/download/latest.json"
       ],

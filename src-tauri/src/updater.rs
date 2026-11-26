@@ -3,13 +3,14 @@ use seasonfetch_core::models::RELEASES_REPO_SLUG;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use tauri::{AppHandle, Emitter};
-use tauri_plugin_updater::UpdaterExt;
+use tauri_plugin_updater::{Update, UpdaterExt};
 
-const STABLE_ENDPOINT: &str =
+pub const STABLE_ENDPOINT: &str =
     "https://github.com/rightcodes1/SeasonFetch-Desktop-Releases/releases/latest/download/latest.json";
-const PREVIEW_ENDPOINT: &str =
+pub const PREVIEW_ENDPOINT: &str =
     "https://github.com/rightcodes1/SeasonFetch-Desktop-Releases/releases/download/preview/beta.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,13 +48,38 @@ struct PersistedUpdaterRecord {
     install_requested_at: Option<String>,
 }
 
+struct StagedUpdate {
+    version: String,
+    update: Update,
+    bytes: Vec<u8>,
+}
+
 pub struct UpdaterManager {
     state_path: PathBuf,
-    state: Mutex<UpdaterState>,
+    state: Arc<Mutex<UpdaterState>>,
+    staged: Mutex<Option<StagedUpdate>>,
+}
+
+fn is_signature_error_message(raw: &str) -> bool {
+    let lower = raw.to_ascii_lowercase();
+    lower.contains("signature")
+        || lower.contains("minisign")
+        || lower.contains("pubkey")
+        || lower.contains("public key")
+        || lower.contains("invalid encoding")
+        || lower.contains("base64")
+        || lower.contains("untrusted")
 }
 
 impl UpdaterManager {
-    pub fn new(state_path: PathBuf, app_version: String, channel: String, auto_check: bool, auto_download: bool, pubkey_configured: bool) -> Self {
+    pub fn new(
+        state_path: PathBuf,
+        app_version: String,
+        channel: String,
+        auto_check: bool,
+        auto_download: bool,
+        pubkey_configured: bool,
+    ) -> Self {
         let persisted: PersistedUpdaterRecord = fs::read_to_string(&state_path)
             .ok()
             .and_then(|raw| serde_json::from_str(&raw).ok())
@@ -90,9 +116,9 @@ impl UpdaterManager {
         let message = if let Some(ref ver) = unfinished {
             format!("Previous update to v{ver} did not complete. Retry or download manually from GitHub Releases.")
         } else if !pubkey_configured {
-            "Tauri Ed25519 signing public key is not yet embedded in this local development build. Configure TAURI_SIGNING_PUBLIC_KEY in tauri.conf.json for signed updates.".to_string()
+            "Tauri Ed25519 signing public key is not yet embedded in this local development build. Configure pubkey in tauri.conf.json for signed updates.".to_string()
         } else {
-            format!("Ready to check {norm_channel} updates on {RELEASES_REPO_SLUG}.")
+            format!("Ready to check {norm_channel} updates on {RELEASES_REPO_SLUG} (Ed25519 signing active).")
         };
 
         let initial = UpdaterState {
@@ -124,7 +150,8 @@ impl UpdaterManager {
 
         Self {
             state_path,
-            state: Mutex::new(initial),
+            state: Arc::new(Mutex::new(initial)),
+            staged: Mutex::new(None),
         }
     }
 
@@ -147,24 +174,45 @@ impl UpdaterManager {
         snap
     }
 
-    pub fn update_preferences(&self, app: &AppHandle, channel: &str, auto_check: bool, auto_download: bool) -> UpdaterState {
-        {
+    pub fn update_preferences(
+        &self,
+        app: &AppHandle,
+        channel: &str,
+        auto_check: bool,
+        auto_download: bool,
+    ) -> UpdaterState {
+        let changed = {
             let mut s = self.state.lock().unwrap();
             let norm = if channel == "preview" { "preview" } else { "stable" };
             let changed = s.channel != norm;
             s.channel = norm.to_string();
-            s.updater_channel = if norm == "preview" { "beta".to_string() } else { "latest".to_string() };
+            s.updater_channel = if norm == "preview" {
+                "beta".to_string()
+            } else {
+                "latest".to_string()
+            };
             s.auto_check_updates = auto_check;
             s.auto_download_updates = auto_download;
             if changed {
                 s.available_version = None;
                 s.progress_percent = 0;
+                s.transferred_bytes = 0;
+                s.total_bytes = 0;
+                s.bytes_per_second = 0;
                 s.postponed = false;
                 s.error_code = None;
                 if s.ed25519_configured {
                     s.status = "idle".to_string();
-                    s.message = format!("Switched to {norm} channel. Click Check for Updates to query {RELEASES_REPO_SLUG}.");
+                    s.message = format!(
+                        "Switched to {norm} channel. Click Check for Updates to query {RELEASES_REPO_SLUG}."
+                    );
                 }
+            }
+            changed
+        };
+        if changed {
+            if let Ok(mut staged) = self.staged.lock() {
+                *staged = None;
             }
         }
         self.emit_state(app)
@@ -186,7 +234,12 @@ impl UpdaterManager {
             s.recovery_message = None;
             s.error_code = None;
             s.retry_count = 0;
-            s.status = if s.ed25519_configured { "idle" } else { "unconfigured" }.to_string();
+            s.status = if s.ed25519_configured {
+                "idle"
+            } else {
+                "unconfigured"
+            }
+            .to_string();
             s.message = "Recovery cleared. Ready to check for updates.".to_string();
         }
         self.emit_state(app)
@@ -203,7 +256,7 @@ impl UpdaterManager {
                 let mut s = self.state.lock().unwrap();
                 s.status = "unconfigured".to_string();
                 s.last_checked_at = Some(Utc::now().to_rfc3339());
-                s.message = "Ed25519 update public key is not yet configured in tauri.conf.json. Add TAURI_SIGNING_PUBLIC_KEY to enable verified Tauri updates.".to_string();
+                s.message = "Ed25519 update public key is not yet configured in tauri.conf.json.".to_string();
             }
             return self.emit_state(app);
         }
@@ -269,7 +322,9 @@ impl UpdaterManager {
                     s.release_notes = notes;
                     s.last_checked_at = Some(Utc::now().to_rfc3339());
                     s.error_code = None;
-                    s.message = format!("SeasonFetch v{next_ver} is available (Ed25519 signature verification ready).");
+                    s.message = format!(
+                        "SeasonFetch v{next_ver} is available ({channel} channel, Ed25519 signature verification ready)."
+                    );
                 }
                 self.emit_state(app)
             }
@@ -281,14 +336,17 @@ impl UpdaterManager {
                     s.last_checked_at = Some(Utc::now().to_rfc3339());
                     s.error_code = None;
                     s.retry_count = 0;
-                    s.message = format!("You are up to date on SeasonFetch v{} ({channel}).", s.current_version);
+                    s.message = format!(
+                        "You are up to date on SeasonFetch v{} ({channel}).",
+                        s.current_version
+                    );
                 }
                 self.emit_state(app)
             }
             Err(err) => {
                 let raw = err.to_string();
                 let lower = raw.to_ascii_lowercase();
-                let (code, friendly, recoverable) = if lower.contains("signature") || lower.contains("pubkey") {
+                let (code, friendly, recoverable) = if is_signature_error_message(&raw) {
                     (
                         "SIGNATURE_VERIFICATION_FAILED",
                         "Update signature verification failed. Installation aborted for your safety.",
@@ -320,20 +378,32 @@ impl UpdaterManager {
                     } else {
                         None
                     };
-                    s.message = friendly.to_string();
+                    s.message = format!("{friendly} ({raw})");
                 }
                 self.emit_state(app)
             }
         }
     }
 
-    pub async fn download_and_install(&self, app: &AppHandle, install_immediately: bool) -> UpdaterState {
+    pub async fn download_and_install(
+        &self,
+        app: &AppHandle,
+        install_immediately: bool,
+    ) -> UpdaterState {
         let (channel, ed25519_ok) = {
             let s = self.state.lock().unwrap();
             (s.channel.clone(), s.ed25519_configured)
         };
         if !ed25519_ok {
             return self.get_state();
+        }
+
+        // If already downloaded & Ed25519-verified and user clicked Restart & Install, install staged bytes immediately
+        if install_immediately {
+            let existing = self.staged.lock().ok().and_then(|mut g| g.take());
+            if let Some(staged) = existing {
+                return self.install_verified_bytes(app, staged.version, staged.update, staged.bytes);
+            }
         }
 
         let endpoint_url = if channel == "preview" {
@@ -352,11 +422,153 @@ impl UpdaterManager {
             return self.get_state();
         };
 
-        let Ok(Some(update)) = updater.check().await else {
-            return self.get_state();
+        let update = match updater.check().await {
+            Ok(Some(u)) => u,
+            Ok(None) => {
+                let mut s = self.state.lock().unwrap();
+                s.status = "not-available".to_string();
+                s.available_version = None;
+                s.message = format!("You are already up to date on SeasonFetch v{}.", s.current_version);
+                drop(s);
+                return self.emit_state(app);
+            }
+            Err(err) => {
+                let raw = err.to_string();
+                let mut s = self.state.lock().unwrap();
+                s.status = "error".to_string();
+                s.error_code = Some(if is_signature_error_message(&raw) {
+                    "SIGNATURE_VERIFICATION_FAILED".to_string()
+                } else {
+                    "UPDATE_CHECK_FAILED".to_string()
+                });
+                s.recovery_required = true;
+                s.recovery_message = Some(format!("Update check failed before download: {raw}"));
+                s.message = "Unable to fetch update metadata.".to_string();
+                drop(s);
+                return self.emit_state(app);
+            }
         };
 
         let version = update.version.clone();
+        {
+            let mut s = self.state.lock().unwrap();
+            s.status = "downloading".to_string();
+            s.available_version = Some(version.clone());
+            s.progress_percent = 0;
+            s.transferred_bytes = 0;
+            s.total_bytes = 0;
+            s.bytes_per_second = 0;
+            s.error_code = None;
+            s.message = format!("Downloading SeasonFetch v{version}...");
+        }
+        self.emit_state(app);
+
+        let app_clone = app.clone();
+        let state_ref = Arc::clone(&self.state);
+        let started_at = Instant::now();
+        let mut downloaded_bytes: u64 = 0;
+
+        // `update.download(...)` downloads the installer AND verifies its Ed25519 signature against `pubkey`.
+        let download_res = update
+            .download(
+                |chunk_len, content_len| {
+                    downloaded_bytes += chunk_len as u64;
+                    let total = content_len.unwrap_or(0);
+                    let pct = if total > 0 {
+                        ((downloaded_bytes as f64 / total as f64) * 100.0)
+                            .round()
+                            .clamp(0.0, 100.0) as u8
+                    } else {
+                        0
+                    };
+                    let elapsed = started_at.elapsed().as_secs_f64().max(0.05);
+                    let bps = (downloaded_bytes as f64 / elapsed).round() as u64;
+                    if let Ok(mut s) = state_ref.lock() {
+                        s.progress_percent = pct;
+                        s.transferred_bytes = downloaded_bytes;
+                        s.total_bytes = total;
+                        s.bytes_per_second = bps;
+                    }
+                    let _ = app_clone.emit(
+                        "updater-progress",
+                        serde_json::json!({
+                            "progressPercent": pct,
+                            "transferredBytes": downloaded_bytes,
+                            "totalBytes": total,
+                            "bytesPerSecond": bps
+                        }),
+                    );
+                },
+                || {},
+            )
+            .await;
+
+        match download_res {
+            Ok(verified_bytes) => {
+                {
+                    let mut s = self.state.lock().unwrap();
+                    s.status = "downloaded".to_string();
+                    s.progress_percent = 100;
+                    s.transferred_bytes = verified_bytes.len() as u64;
+                    if s.total_bytes == 0 {
+                        s.total_bytes = verified_bytes.len() as u64;
+                    }
+                    s.error_code = None;
+                    s.message = format!(
+                        "SeasonFetch v{version} downloaded and Ed25519 signature verified ({} bytes).",
+                        verified_bytes.len()
+                    );
+                }
+                let snap = self.emit_state(app);
+
+                if install_immediately {
+                    self.install_verified_bytes(app, version, update, verified_bytes)
+                } else {
+                    if let Ok(mut staged) = self.staged.lock() {
+                        *staged = Some(StagedUpdate {
+                            version,
+                            update,
+                            bytes: verified_bytes,
+                        });
+                    }
+                    snap
+                }
+            }
+            Err(err) => {
+                let raw = err.to_string();
+                let is_sig = is_signature_error_message(&raw);
+                {
+                    let mut s = self.state.lock().unwrap();
+                    s.status = "error".to_string();
+                    s.error_code = Some(if is_sig {
+                        "SIGNATURE_VERIFICATION_FAILED".to_string()
+                    } else {
+                        "UPDATE_DOWNLOAD_FAILED".to_string()
+                    });
+                    s.recovery_required = true;
+                    s.recovery_message = Some(if is_sig {
+                        format!("Ed25519 signature verification failed — tampered or mismatched installer rejected safely ({raw}).")
+                    } else {
+                        format!("Update download failed: {raw}")
+                    });
+                    s.message = if is_sig {
+                        "Update rejected: Ed25519 signature verification failed.".to_string()
+                    } else {
+                        "Update download failed. Retry or download manually from GitHub Releases.".to_string()
+                    };
+                }
+                self.emit_state(app)
+            }
+        }
+    }
+
+    fn install_verified_bytes(
+        &self,
+        app: &AppHandle,
+        version: String,
+        update: Update,
+        bytes: Vec<u8>,
+    ) -> UpdaterState {
         let current_ver = self.state.lock().unwrap().current_version.clone();
         let _ = Self::write_persisted(
             &self.state_path,
@@ -367,53 +579,26 @@ impl UpdaterManager {
             },
         );
 
-        let app_clone = app.clone();
-        let mut downloaded_bytes: u64 = 0;
-
-        let res = update
-            .download_and_install(
-                |chunk_len, content_len| {
-                    downloaded_bytes += chunk_len as u64;
-                    let total = content_len.unwrap_or(0);
-                    let pct = if total > 0 {
-                        ((downloaded_bytes as f64 / total as f64) * 100.0).round().clamp(0.0, 100.0) as u8
-                    } else {
-                        0
-                    };
-                    let _ = app_clone.emit(
-                        "updater-progress",
-                        serde_json::json!({
-                            "progressPercent": pct,
-                            "transferredBytes": downloaded_bytes,
-                            "totalBytes": total
-                        }),
-                    );
-                },
-                || {},
-            )
-            .await;
-
-        match res {
+        match update.install(bytes) {
             Ok(()) => {
                 {
                     let mut s = self.state.lock().unwrap();
                     s.status = "downloaded".to_string();
                     s.progress_percent = 100;
-                    s.message = format!("SeasonFetch v{version} verified and staged.");
+                    s.message = format!("Installing verified SeasonFetch v{version} and restarting...");
                 }
-                let snap = self.emit_state(app);
-                if install_immediately {
-                    app.restart();
-                }
-                snap
+                let _snap = self.emit_state(app);
+                app.restart();
+                #[allow(unreachable_code)]
+                _snap
             }
             Err(err) => {
                 {
                     let mut s = self.state.lock().unwrap();
                     s.status = "error".to_string();
-                    s.error_code = Some("UPDATE_FAILED".to_string());
+                    s.error_code = Some("UPDATE_INSTALL_FAILED".to_string());
                     s.recovery_required = true;
-                    s.recovery_message = Some(format!("Update verification or install failed: {err}"));
+                    s.recovery_message = Some(format!("Verified installer failed to run: {err}"));
                     s.message = "Update installation failed. Download manually from GitHub Releases.".to_string();
                 }
                 self.emit_state(app)

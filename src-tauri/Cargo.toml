@@ -29,6 +29,7 @@ base64 = "0.22"
 url = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 libloading = "0.8"
+minisign-verify = "0.3"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Security_Cryptography", "Win32_Foundation", "Win32_System_Memory", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader"] }

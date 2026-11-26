@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - 'v*'
+      - 'tauri-v*'
   workflow_dispatch:
     inputs:
       publish_release:
@@ -54,12 +55,17 @@ jobs:
             Write-Error "Version mismatch: package.json ($version) != src-tauri/tauri.conf.json ($($tauriConf.version))."
             exit 1
           }
+          if ([string]::IsNullOrWhiteSpace([string]$tauriConf.plugins.updater.pubkey)) {
+            Write-Error "src-tauri/tauri.conf.json plugins.updater.pubkey is empty."
+            exit 1
+          }
           $isTag = "${{ github.ref_type }}" -eq "tag"
           $manualPublish = "${{ inputs.publish_release }}" -eq "true"
           $shouldPublish = $isTag -or $manualPublish
-          $tagName = if ($isTag) { "${{ github.ref_name }}" } else { "v$version" }
-          if ($isTag -and $tagName -ne "v$version") {
-            Write-Error "Tag '$tagName' does not match version 'v$version'."
+          $rawTag = if ($isTag) { "${{ github.ref_name }}" } else { "v$version" }
+          $releaseTag = $rawTag -replace '^tauri-', ''
+          if ($isTag -and $releaseTag -ne "v$version") {
+            Write-Error "Tag '$rawTag' (normalized '$releaseTag') does not match version 'v$version'."
             exit 1
           }
           if ($version -match '-beta\.\d+$') {
@@ -75,7 +81,7 @@ jobs:
             exit 1
           }
           echo "version=$version" >> $env:GITHUB_OUTPUT
-          echo "tag=$tagName" >> $env:GITHUB_OUTPUT
+          echo "tag=$releaseTag" >> $env:GITHUB_OUTPUT
           echo "channel=$channel" >> $env:GITHUB_OUTPUT
           echo "manifest_file=$manifestFile" >> $env:GITHUB_OUTPUT
           echo "is_prerelease=$isPrerelease" >> $env:GITHUB_OUTPUT
@@ -126,7 +132,7 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) {
             Write-Host "No TAURI_SIGNING_PRIVATE_KEY set (dry-run mode) — building unsigned NSIS bundle."
             $cfgPath = Join-Path $env:RUNNER_TEMP "tauri-dryrun.json"
-            '{"bundle":{"createUpdaterArtifacts":false}}' | Set-Content $cfgPath -Encoding UTF8
+            [System.IO.File]::WriteAllText($cfgPath, '{"bundle":{"createUpdaterArtifacts":false}}', [System.Text.UTF8Encoding]::new($false))
             npm run tauri:build -- --bundles nsis --config $cfgPath
           } else {
             npm run tauri:build -- --bundles nsis
@@ -137,7 +143,9 @@ jobs:
         run: |
           $version = "${{ steps.meta.outputs.version }}"
           $tag = "${{ steps.meta.outputs.tag }}"
+          $channel = "${{ steps.meta.outputs.channel }}"
           $manifestFile = "${{ steps.meta.outputs.manifest_file }}"
+          $shouldPublish = "${{ steps.meta.outputs.should_publish }}" -eq "true"
           $nsisDir = "target\release\bundle\nsis"
           $outDir = "release-tauri"
           New-Item -ItemType Directory -Force -Path $outDir | Out-Null
@@ -156,11 +164,17 @@ jobs:
             Copy-Item $sigFile.FullName (Join-Path $outDir "$destExeName.sig") -Force
             $sigContent = (Get-Content $sigFile.FullName -Raw).Trim()
           }
+          if ($shouldPublish -and [string]::IsNullOrWhiteSpace($sigContent)) {
+            Write-Error "Refusing to publish: Ed25519 .sig signature artifact is missing!"
+            exit 1
+          }
 
+          $summary = "${{ inputs.release_notes_summary }}".Trim()
+          $notesText = if ($summary) { "$summary`n`nSeasonFetch Desktop $tag ($channel)" } else { "SeasonFetch Desktop $tag ($channel) — signed Tauri 2 Windows release." }
           $downloadUrl = "https://github.com/$($env:RELEASES_REPO)/releases/download/$tag/$destExeName"
           $manifest = [ordered]@{
             version = $version
-            notes = "SeasonFetch Desktop $tag (${{ steps.meta.outputs.channel }})"
+            notes = $notesText
             pub_date = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
             platforms = [ordered]@{
               "windows-x86_64" = [ordered]@{
@@ -169,14 +183,16 @@ jobs:
               }
             }
           }
-          $manifest | ConvertTo-Json -Depth 5 | Set-Content -Path (Join-Path $outDir $manifestFile) -Encoding UTF8
+          $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+          $manifestJson = ($manifest | ConvertTo-Json -Depth 5) + "`n"
+          [System.IO.File]::WriteAllText((Join-Path (Resolve-Path $outDir) $manifestFile), $manifestJson, $utf8NoBom)
 
           $filesToHash = Get-ChildItem $outDir -File | Where-Object { $_.Name -ne "SHA256SUMS.txt" }
           $sums = foreach ($f in $filesToHash) {
             $h = (Get-FileHash $f.FullName -Algorithm SHA256).Hash.ToLower()
             "$h  $($f.Name)"
           }
-          $sums | Set-Content -Path (Join-Path $outDir "SHA256SUMS.txt") -Encoding UTF8
+          [System.IO.File]::WriteAllText((Join-Path (Resolve-Path $outDir) "SHA256SUMS.txt"), (($sums -join "`n") + "`n"), $utf8NoBom)
           Get-Content (Join-Path $outDir "SHA256SUMS.txt")
 
       - name: Upload workflow build artifacts
@@ -194,20 +210,41 @@ jobs:
         run: |
           $repo = $env:RELEASES_REPO
           $tag = "${{ steps.meta.outputs.tag }}"
+          $channel = "${{ steps.meta.outputs.channel }}"
+          $manifestFile = "${{ steps.meta.outputs.manifest_file }}"
           $isPrerelease = "${{ steps.meta.outputs.is_prerelease }}" -eq "true"
+
           gh release view $tag --repo $repo *> $null
           if ($LASTEXITCODE -eq 0) {
             Write-Error "Release $tag already exists in $repo. Bump version instead of overwriting."
             exit 1
           }
+
           $assets = Get-ChildItem "release-tauri" -File | Select-Object -ExpandProperty FullName
           $args = @(
             "release", "create", $tag
           ) + $assets + @(
             "--repo", $repo,
             "--title", "SeasonFetch Desktop $tag (Tauri 2)",
-            "--notes", "SeasonFetch Desktop $tag (${{ steps.meta.outputs.channel }}) — Tauri 2 Windows NSIS installer with Ed25519 updater manifest."
+            "--notes", "SeasonFetch Desktop $tag ($channel) — Tauri 2 Windows NSIS installer with Ed25519 updater manifest and SHA256SUMS."
           )
           if ($isPrerelease) { $args += "--prerelease" }
           gh @args
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          # Maintain rolling `preview` prerelease feed so Preview clients can always fetch /releases/download/preview/beta.json
+          if ($channel -eq "preview") {
+            $manifestPath = Join-Path "release-tauri" $manifestFile
+            gh release view preview --repo $repo *> $null
+            if ($LASTEXITCODE -ne 0) {
+              gh release create preview $manifestPath `
+                --repo $repo `
+                --prerelease `
+                --title "SeasonFetch Desktop Preview Update Feed" `
+                --notes "Rolling Preview channel manifest (beta.json). Points to immutable versioned Preview releases."
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            } else {
+              gh release upload preview $manifestPath --repo $repo --clobber
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            }
+          }

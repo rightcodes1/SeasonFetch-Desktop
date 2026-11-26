@@ -502,6 +502,51 @@ pub fn run() {
                 native_player,
             });
 
+            // Optional CLI flag `--auto-update-now` triggers the exact production signed updater pipeline
+            // (check -> download -> Ed25519 verify -> install -> restart) for end-to-end verification.
+            let auto_update_cli = std::env::args().any(|a| a == "--auto-update-now");
+            if auto_update_cli {
+                let app_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    let Some(st) = app_handle.try_state::<AppState>() else {
+                        return;
+                    };
+                    st.logger.info("updater", "CLI --auto-update-now triggered: checking update feed");
+                    let checked = st.updater.check_for_updates(&app_handle).await;
+                    st.logger.info(
+                        "updater",
+                        &format!(
+                            "Check result: status={} current={} available={:?} channel={} msg={}",
+                            checked.status,
+                            checked.current_version,
+                            checked.available_version,
+                            checked.channel,
+                            checked.message
+                        ),
+                    );
+                    if checked.status == "available" {
+                        st.logger.info("updater", "Update available — downloading and verifying Ed25519 signature");
+                        let downloaded = st.updater.download_and_install(&app_handle, false).await;
+                        st.logger.info(
+                            "updater",
+                            &format!(
+                                "Download/verify result: status={} progress={}% bytes={} error={:?} msg={}",
+                                downloaded.status,
+                                downloaded.progress_percent,
+                                downloaded.transferred_bytes,
+                                downloaded.error_code,
+                                downloaded.message
+                            ),
+                        );
+                        if downloaded.status == "downloaded" {
+                            st.logger.info("updater", "Signature verified — launching passive NSIS installer and restarting");
+                            let _ = st.updater.download_and_install(&app_handle, true).await;
+                        }
+                    }
+                });
+            }
+
             // Build native Windows system tray
             if let (Ok(show_item), Ok(updates_item), Ok(quit_item)) = (
                 MenuItem::with_id(app, "show", "Open SeasonFetch", true, None::<&str>),

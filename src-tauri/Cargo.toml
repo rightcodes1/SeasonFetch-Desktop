@@ -1,6 +1,6 @@
 [package]
 name = "seasonfetch-desktop"
-version = "0.1.1-beta.3"
+version = "0.1.1-beta.4"
 default-run = "seasonfetch-desktop"
 description = "SeasonFetch Desktop — Tauri 2 + Rust + React Windows Media Application"
 authors = ["SeasonFetch"]

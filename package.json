@@ -1,0 +1,79 @@
+{
+  "name": "seasonfetch-desktop",
+  "productName": "SeasonFetch",
+  "version": "0.1.0",
+  "description": "Dedicated Windows desktop client for SeasonFetch.",
+  "private": true,
+  "type": "module",
+  "main": "electron/main.cjs",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev:renderer": "node ./node_modules/vite/bin/vite.js",
+    "dev": "node scripts/dev.mjs",
+    "build:renderer": "node ./node_modules/vite/bin/vite.js build",
+    "start": "electron .",
+    "smoke": "electron . --smoke-test",
+    "dist:dir": "npm run build:renderer && electron-builder --win --dir",
+    "dist:win": "npm run build:renderer && electron-builder --win nsis",
+    "test": "node --test tests/*.test.js"
+  },
+  "dependencies": {
+    "electron-updater": "^6.6.2",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.5.2",
+    "electron": "^35.2.0",
+    "electron-builder": "^26.0.12",
+    "vite": "^6.3.5"
+  },
+  "build": {
+    "appId": "app.seasonfetch.desktop",
+    "productName": "SeasonFetch",
+    "asar": true,
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "package.json"
+    ],
+    "win": {
+      "icon": "build/icon.ico",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "verifyUpdateCodeSignature": true
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "SeasonFetch"
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "rightcodes1",
+        "repo": "SeasonFetch-Desktop",
+        "private": true,
+        "releaseType": "draft"
+      }
+    ]
+  },
+  "allowScripts": {
+    "electron@35.7.5": true,
+    "esbuild@0.25.12": true
+  }
+}

@@ -1,0 +1,80 @@
+name: Build and Release Windows Desktop
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: 'Release channel (stable or preview)'
+        required: true
+        default: 'preview'
+        type: choice
+        options:
+          - preview
+          - stable
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout SeasonFetch-Desktop
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run desktop unit tests
+        run: npm test
+
+      - name: Build renderer bundle
+        run: npm run build:renderer
+
+      - name: Determine release channel
+        id: channel
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          if ($tag -match '-(preview|beta|alpha|rc)') {
+            echo "channel=beta" >> $env:GITHUB_OUTPUT
+            echo "is_prerelease=true" >> $env:GITHUB_OUTPUT
+          } elseif ("${{ inputs.channel }}" -eq "preview") {
+            echo "channel=beta" >> $env:GITHUB_OUTPUT
+            echo "is_prerelease=true" >> $env:GITHUB_OUTPUT
+          } else {
+            echo "channel=latest" >> $env:GITHUB_OUTPUT
+            echo "is_prerelease=false" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Build Windows installer and updater artifacts
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WIN_CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
+          WIN_CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
+        run: |
+          if ("${{ github.ref_type }}" -eq "tag") {
+            npx electron-builder --win nsis --publish always -c.generateUpdatesFilesForAllChannels=true
+          } else {
+            npx electron-builder --win nsis --publish never -c.generateUpdatesFilesForAllChannels=true
+          }
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: seasonfetch-windows-${{ steps.channel.outputs.channel }}
+          path: |
+            release/*.exe
+            release/*.blockmap
+            release/*.yml
+          retention-days: 14

@@ -1,0 +1,10 @@
+[package]
+name = "seasonfetch-core"
+version = "0.1.0"
+edition = "2021"
+description = "Platform-independent shared Rust domain core for SeasonFetch Desktop (Windows) and future Android clients."
+license = "UNLICENSED"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+url = "2"

@@ -19,15 +19,28 @@
     "release:check": "node scripts/release-check.mjs",
     "dist:dir": "npm run build:renderer && electron-builder --win --dir",
     "dist:win": "npm run release:check && npm run build:renderer && electron-builder --win nsis",
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build",
+    "rust:check": "cargo check --workspace",
+    "rust:test": "cargo test --workspace",
     "test": "node --test tests/*.test.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.119.2",
+    "@tauri-apps/api": "^2.12.5",
+    "@tauri-apps/plugin-dialog": "^2.8.4",
+    "@tauri-apps/plugin-notification": "^2.8.1",
+    "@tauri-apps/plugin-opener": "^2.7.3",
+    "@tauri-apps/plugin-process": "^2.4.0",
+    "@tauri-apps/plugin-updater": "^2.14.1",
     "electron-updater": "^6.6.2",
+    "lucide-react": "^1.81.0",
     "react": "^19.1.0",
     "react-dom": "^19.1.0"
   },
   "devDependencies": {
+    "@tauri-apps/cli": "^2.12.6",
     "@vitejs/plugin-react": "^4.5.2",
     "electron": "^35.2.0",
     "electron-builder": "^26.0.12",

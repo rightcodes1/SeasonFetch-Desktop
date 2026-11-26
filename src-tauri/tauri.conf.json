@@ -1,0 +1,62 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "SeasonFetch",
+  "version": "0.1.0",
+  "identifier": "app.seasonfetch.desktop",
+  "build": {
+    "beforeDevCommand": "npm run dev:renderer",
+    "devUrl": "http://127.0.0.1:5175",
+    "beforeBuildCommand": "npm run build:renderer",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "SeasonFetch",
+        "width": 1320,
+        "height": 860,
+        "minWidth": 980,
+        "minHeight": 640,
+        "decorations": false,
+        "resizable": true,
+        "fullscreen": false,
+        "backgroundColor": "#0b0c10",
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' https: data: asset: http://asset.localhost; media-src 'self' https: http://127.0.0.1:11470 asset: http://asset.localhost blob:; connect-src 'self' https://*.supabase.co http://127.0.0.1:11470 http://127.0.0.1:5175 ws://127.0.0.1:5175; object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
+      "assetProtocol": {
+        "enable": true,
+        "scope": ["**"]
+      }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "createUpdaterArtifacts": true,
+    "icon": [
+      "icons/icon.ico",
+      "icons/icon.png"
+    ],
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "displayLanguageSelector": false
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "",
+      "endpoints": [
+        "https://github.com/rightcodes1/SeasonFetch-Desktop-Releases/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  }
+}

@@ -1,0 +1,208 @@
+name: Build and Release Windows Desktop (Tauri 2)
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: 'Publish to rightcodes1/SeasonFetch-Desktop-Releases (leave unchecked for dry-run build)'
+        required: true
+        default: false
+        type: boolean
+      release_notes_summary:
+        description: 'Optional short summary prepended to GitHub Release notes'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-release-tauri-windows:
+    runs-on: windows-latest
+    env:
+      RELEASES_REPO: rightcodes1/SeasonFetch-Desktop-Releases
+    steps:
+      - name: Checkout private SeasonFetch-Desktop source
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Setup Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo dependencies
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target'
+
+      - name: Resolve version and channel
+        id: meta
+        shell: pwsh
+        run: |
+          $pkg = Get-Content package.json -Raw | ConvertFrom-Json
+          $tauriConf = Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
+          $version = [string]$pkg.version
+          if ([string]$tauriConf.version -ne $version) {
+            Write-Error "Version mismatch: package.json ($version) != src-tauri/tauri.conf.json ($($tauriConf.version))."
+            exit 1
+          }
+          $isTag = "${{ github.ref_type }}" -eq "tag"
+          $manualPublish = "${{ inputs.publish_release }}" -eq "true"
+          $shouldPublish = $isTag -or $manualPublish
+          $tagName = if ($isTag) { "${{ github.ref_name }}" } else { "v$version" }
+          if ($isTag -and $tagName -ne "v$version") {
+            Write-Error "Tag '$tagName' does not match version 'v$version'."
+            exit 1
+          }
+          if ($version -match '-beta\.\d+$') {
+            $channel = "preview"
+            $manifestFile = "beta.json"
+            $isPrerelease = "true"
+          } elseif ($version -match '^\d+\.\d+\.\d+$') {
+            $channel = "stable"
+            $manifestFile = "latest.json"
+            $isPrerelease = "false"
+          } else {
+            Write-Error "Invalid SemVer '$version'. Use X.Y.Z for Stable or X.Y.Z-beta.N for Preview."
+            exit 1
+          }
+          echo "version=$version" >> $env:GITHUB_OUTPUT
+          echo "tag=$tagName" >> $env:GITHUB_OUTPUT
+          echo "channel=$channel" >> $env:GITHUB_OUTPUT
+          echo "manifest_file=$manifestFile" >> $env:GITHUB_OUTPUT
+          echo "is_prerelease=$isPrerelease" >> $env:GITHUB_OUTPUT
+          echo "should_publish=$($shouldPublish.ToString().ToLower())" >> $env:GITHUB_OUTPUT
+
+      - name: Validate required build variables and secrets
+        shell: pwsh
+        env:
+          VITE_SUPABASE_URL: ${{ vars.VITE_SUPABASE_URL || secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_PUBLISHABLE_KEY: ${{ vars.VITE_SUPABASE_PUBLISHABLE_KEY || secrets.VITE_SUPABASE_PUBLISHABLE_KEY }}
+          RELEASES_REPO_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          $missing = @()
+          if ([string]::IsNullOrWhiteSpace($env:VITE_SUPABASE_URL)) { $missing += "VITE_SUPABASE_URL" }
+          if ([string]::IsNullOrWhiteSpace($env:VITE_SUPABASE_PUBLISHABLE_KEY)) { $missing += "VITE_SUPABASE_PUBLISHABLE_KEY" }
+          if ("${{ steps.meta.outputs.should_publish }}" -eq "true") {
+            if ([string]::IsNullOrWhiteSpace($env:RELEASES_REPO_TOKEN)) { $missing += "RELEASES_REPO_TOKEN" }
+            if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) { $missing += "TAURI_SIGNING_PRIVATE_KEY (Ed25519)" }
+          }
+          if ($missing.Count -gt 0) {
+            Write-Error ("Missing required CI configuration:`n  - " + ($missing -join "`n  - "))
+            exit 1
+          }
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Run Rust & JS unit tests
+        run: |
+          cargo test -p seasonfetch-core
+          cargo check -p seasonfetch-desktop
+          npm test
+
+      - name: Build Tauri 2 Windows NSIS installer and Ed25519 signature
+        shell: pwsh
+        env:
+          VITE_SUPABASE_URL: ${{ vars.VITE_SUPABASE_URL || secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_PUBLISHABLE_KEY: ${{ vars.VITE_SUPABASE_PUBLISHABLE_KEY || secrets.VITE_SUPABASE_PUBLISHABLE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) {
+            Write-Host "No TAURI_SIGNING_PRIVATE_KEY set (dry-run mode) — building unsigned NSIS bundle."
+            $cfgPath = Join-Path $env:RUNNER_TEMP "tauri-dryrun.json"
+            '{"bundle":{"createUpdaterArtifacts":false}}' | Set-Content $cfgPath -Encoding UTF8
+            npm run tauri:build -- --bundles nsis --config $cfgPath
+          } else {
+            npm run tauri:build -- --bundles nsis
+          }
+
+      - name: Generate Tauri updater JSON manifest and SHA256SUMS.txt
+        shell: pwsh
+        run: |
+          $version = "${{ steps.meta.outputs.version }}"
+          $tag = "${{ steps.meta.outputs.tag }}"
+          $manifestFile = "${{ steps.meta.outputs.manifest_file }}"
+          $nsisDir = "target\release\bundle\nsis"
+          $outDir = "release-tauri"
+          New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+
+          $exe = Get-ChildItem $nsisDir -Filter "*-setup.exe" | Select-Object -First 1
+          if (-not $exe) {
+            Write-Error "Missing built NSIS installer in $nsisDir"
+            exit 1
+          }
+          $destExeName = "SeasonFetch-Setup-$version.exe"
+          Copy-Item $exe.FullName (Join-Path $outDir $destExeName) -Force
+
+          $sigFile = Get-ChildItem $nsisDir -Filter "*.sig" | Select-Object -First 1
+          $sigContent = ""
+          if ($sigFile) {
+            Copy-Item $sigFile.FullName (Join-Path $outDir "$destExeName.sig") -Force
+            $sigContent = (Get-Content $sigFile.FullName -Raw).Trim()
+          }
+
+          $downloadUrl = "https://github.com/$($env:RELEASES_REPO)/releases/download/$tag/$destExeName"
+          $manifest = [ordered]@{
+            version = $version
+            notes = "SeasonFetch Desktop $tag (${{ steps.meta.outputs.channel }})"
+            pub_date = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+            platforms = [ordered]@{
+              "windows-x86_64" = [ordered]@{
+                signature = $sigContent
+                url = $downloadUrl
+              }
+            }
+          }
+          $manifest | ConvertTo-Json -Depth 5 | Set-Content -Path (Join-Path $outDir $manifestFile) -Encoding UTF8
+
+          $filesToHash = Get-ChildItem $outDir -File | Where-Object { $_.Name -ne "SHA256SUMS.txt" }
+          $sums = foreach ($f in $filesToHash) {
+            $h = (Get-FileHash $f.FullName -Algorithm SHA256).Hash.ToLower()
+            "$h  $($f.Name)"
+          }
+          $sums | Set-Content -Path (Join-Path $outDir "SHA256SUMS.txt") -Encoding UTF8
+          Get-Content (Join-Path $outDir "SHA256SUMS.txt")
+
+      - name: Upload workflow build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: seasonfetch-tauri-windows-${{ steps.meta.outputs.tag }}
+          path: release-tauri/*
+          retention-days: 14
+
+      - name: Publish release artifacts to public SeasonFetch-Desktop-Releases
+        if: steps.meta.outputs.should_publish == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
+        run: |
+          $repo = $env:RELEASES_REPO
+          $tag = "${{ steps.meta.outputs.tag }}"
+          $isPrerelease = "${{ steps.meta.outputs.is_prerelease }}" -eq "true"
+          gh release view $tag --repo $repo *> $null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Error "Release $tag already exists in $repo. Bump version instead of overwriting."
+            exit 1
+          }
+          $assets = Get-ChildItem "release-tauri" -File | Select-Object -ExpandProperty FullName
+          $args = @(
+            "release", "create", $tag
+          ) + $assets + @(
+            "--repo", $repo,
+            "--title", "SeasonFetch Desktop $tag (Tauri 2)",
+            "--notes", "SeasonFetch Desktop $tag (${{ steps.meta.outputs.channel }}) — Tauri 2 Windows NSIS installer with Ed25519 updater manifest."
+          )
+          if ($isPrerelease) { $args += "--prerelease" }
+          gh @args
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

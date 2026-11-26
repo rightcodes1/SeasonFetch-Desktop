@@ -5,6 +5,7 @@ import {
   checkForUpdates,
   clearDesktopHistory,
   clearLocalCache,
+  clearStreamCache,
   dismissUpdaterRecovery,
   downloadAvailableUpdate,
   fetchBackendHealth,
@@ -336,6 +337,27 @@ export default function App() {
           rawPath: dp.target,
           resumeSecs: 0,
           subtitleFile: dp.subtitleFile || null
+        });
+      }
+      if (payload?.diagMagnet?.magnetUri) {
+        const dm = payload.diagMagnet;
+        setPlayerSession({
+          mediaKey: `diag-magnet:${dm.title || 'stream'}`,
+          title: dm.title || 'Diagnostic Torrent Stream',
+          subtitle: 'SeasonFetch Embedded Torrent Engine',
+          streamUrl: null,
+          rawPath: null,
+          magnetUri: dm.magnetUri,
+          torrentRequest: {
+            title: dm.title || 'Diagnostic Torrent Stream',
+            magnetUri: dm.magnetUri,
+            infoHash: null,
+            fileIdx: Number.isInteger(dm.fileIdx) ? dm.fileIdx : null,
+            season: null,
+            episode: null,
+            trackers: []
+          },
+          resumeSecs: 0
         });
       }
     });
@@ -817,7 +839,7 @@ export default function App() {
       fileIdx: Number.isInteger(releaseItem.fileIdx) ? releaseItem.fileIdx : null
     });
 
-    if (!resolved?.playableInApp || !resolved.streamUrl) {
+    if (!resolved?.playableInApp) {
       setPlaybackModalResolution(resolved);
       return;
     }
@@ -826,6 +848,45 @@ export default function App() {
       ? `movie:${selectedItem?.imdbId}`
       : `series:${selectedItem?.imdbId}:${season}:${releaseItem.number}`;
     const existing = await getPlaybackProgress(mediaKey);
+
+    if (resolved.kind === 'embeddedTorrent') {
+      setPlayerSession({
+        mediaKey,
+        title: selectedItem?.title || releaseItem.title,
+        subtitle: isMovie
+          ? releaseItem.format || 'Embedded Torrent Stream'
+          : `Season ${season} · Episode ${releaseItem.number} — ${releaseItem.title}`,
+        streamUrl: null,
+        rawPath: null,
+        magnetUri: resolved.magnetUri || releaseItem.magnet || null,
+        torrentRequest: {
+          title: label,
+          magnetUri: resolved.magnetUri || releaseItem.magnet || null,
+          infoHash: resolved.infoHash || releaseItem.hash || null,
+          fileIdx: Number.isInteger(releaseItem.fileIdx) ? releaseItem.fileIdx : null,
+          season: isMovie ? null : Number(season) || null,
+          episode: isMovie ? null : Number(releaseItem.number) || null,
+          trackers: []
+        },
+        imdbId: selectedItem?.imdbId,
+        mediaType: isMovie ? 'movie' : 'series',
+        season: isMovie ? null : season,
+        episode: isMovie ? null : releaseItem.number,
+        resumeSecs: existing?.positionSecs || 0,
+        nextEpisode
+      });
+      logActivity({
+        kind: 'playback',
+        title: label,
+        subtitle: 'Streaming via SeasonFetch Embedded Torrent Engine'
+      });
+      return;
+    }
+
+    if (!resolved.streamUrl) {
+      setPlaybackModalResolution(resolved);
+      return;
+    }
 
     if (settings?.player?.preferredEngine === 'mpv' && playerBackend?.mpvAvailable) {
       const res = await launchNativeMpv({
@@ -846,6 +907,7 @@ export default function App() {
       subtitle: isMovie ? releaseItem.format : `Season ${season} · Episode ${releaseItem.number} — ${releaseItem.title}`,
       streamUrl: resolved.streamUrl,
       rawPath: null,
+      magnetUri: resolved.magnetUri || releaseItem.magnet || null,
       imdbId: selectedItem?.imdbId,
       mediaType: isMovie ? 'movie' : 'series',
       season: isMovie ? null : season,
@@ -1253,6 +1315,12 @@ export default function App() {
                   refreshAllCatalogs(true);
                   showToast('Local cache cleared');
                 }}
+                onClearStreamCache={async () => {
+                  const res = await clearStreamCache();
+                  await refreshPlayerStatus();
+                  const mb = res?.freedBytes ? ` (${(res.freedBytes / (1024 * 1024)).toFixed(1)} MB freed)` : '';
+                  showToast(`Torrent stream cache cleared${mb}`);
+                }}
                 onClearHistory={async () => {
                   const next = await clearDesktopHistory();
                   if (next?.activityLog) setSettings(next);
@@ -1281,13 +1349,14 @@ export default function App() {
           playerPrefs={settings?.player}
           playerBackend={playerBackend}
           onUpdatePlayerPrefs={patch => handleSettingsPatch({ player: { ...(settings?.player || {}), ...patch } }, { silent: true })}
+          onOpenMagnet={handleOpenMagnet}
           onPlayNextEpisode={nextEp => {
             setPlayerSession(null);
             handlePlayRelease(nextEp, { isMovie: false });
           }}
           onClose={() => {
             setPlayerSession(null);
-            listPlaybackProgress().then(p => Array.isArray(p) && setPlaybackProgress(p)).catch(() => {});
+            refreshPlayerStatus().catch(() => {});
           }}
           onToast={showToast}
         />

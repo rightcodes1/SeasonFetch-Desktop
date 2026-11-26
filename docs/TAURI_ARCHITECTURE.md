@@ -15,7 +15,6 @@ SeasonFetch Desktop (`tauri-rebuild`) separates platform-independent application
 | src-tauri (Windows Native Shell)                                      |
 |  ├─ native_player/                                                    |
 |  │   ├─ mod.rs            (Playback Engine Abstraction & Manager)     |
-|  │   ├─ win32_surface.rs  (Click-through WS_CHILD HWND @ HWND_BOTTOM) |
 |  │   ├─ libmpv_backend.rs (Primary: bundled libmpv-2.dll via FFI)     |
 |  │   └─ libvlc_backend.rs (Optional: system libvlc.dll via FFI)       |
 |  ├─ api_bridge.rs         (SeasonFetch API + direct Cinemeta SWR)     |
@@ -23,6 +22,13 @@ SeasonFetch Desktop (`tauri-rebuild`) separates platform-independent application
 |  ├─ settings.rs           (Atomic settings + resume + activity)       |
 |  ├─ protocol.rs           (Read-only Windows magnet: registry check)  |
 |  └─ updater.rs            (Tauri 2 Ed25519 signed updater)            |
++----------------------------------▲------------------------------------+
+                                   │
++----------------------------------▼------------------------------------+
+| crates/seasonfetch-streaming (Pure-Rust Streaming Engine — Desktop+Android)
+|  ├─ lib.rs         (librqbit session, metadata, file filter, cleanup) |
+|  ├─ http_server.rs (Loopback 127.0.0.1:0 HTTP/1.1 Range 206 server)   |
+|  └─ storage.rs     (Cross-platform 2 MiB SparseChunkStorage)          |
 +----------------------------------▲------------------------------------+
                                    │
 +----------------------------------▼------------------------------------+
@@ -68,7 +74,34 @@ Users can switch engines anytime in **Settings → Player** or inside the live *
 
 ---
 
-## 4. Security & Release Pipeline
+## 4. Stremio-Style Embedded Torrent Streaming Engine (`crates/seasonfetch-streaming`)
+
+### 4.1 How Stremio's Streaming Architecture Works
+Stremio Desktop decouples discovery, torrent streaming, and media playback into three independent layers:
+1. **Discovery / Addons:** Resolves media metadata and torrent candidates (`infoHash`, `fileIdx`, tracker list).
+2. **Local Loopback Streaming Engine:** Connects to DHT and trackers, fetches torrent metadata (`ut_metadata`), selects the requested file, prioritizes pieces around the active read offset (plus container tail metadata for MKV `Cues` / MP4 `moov`), and serves the file over `http://127.0.0.1:<port>/...` with full HTTP `Accept-Ranges: bytes` (`206 Partial Content`) support.
+3. **Embedded Media Player (`libmpv`):** Streams directly from the loopback HTTP URL, seeking via byte-range requests without downloading the full torrent first, while decoding MKV/HEVC/AC3/EAC3/TrueHD and rendering native `libass` subtitles.
+
+### 4.2 Source-Code Evaluation of `stremio-native/stream-server`
+We inspected the actual source code, `Cargo.toml` manifests, vendor licenses, release workflows, and binaries of `https://github.com/stremio-native/stream-server` (`v0.1.8`, active through Oct 2026):
+- **Architecture:** Multi-crate Rust workspace (`enginefs`, `server`, `bindings/libtorrent-sys`, `bindings/async-rar`, `settings-gui`) providing a standalone replacement for Stremio's `server.js` on port `11470`.
+- **Dependencies & Licensing Findings:**
+  - Default backend links C++ `libtorrent-rasterbar 2.1.1` + Boost via `cxx-build` and `vcpkg` overlays (~30.5 MB Windows sidecar binary, heavy MSVC/vcpkg build pipeline).
+  - Unconditionally vendors C++ `UnRAR` (`bindings/async-rar/vendor/unrar/license.txt`), which carries non-OSI freeware restrictions rather than MIT/Apache-2.0.
+  - Bundles standalone daemon features unrelated to SeasonFetch (`slint` settings GUI, `ratatui` TUI, `ssdp-client`, `ytdlp`, `nzb`, `ftp`, `ffmpeg` HLS setup, process-global `stream-server.lock`, fixed port `11470` that conflicts if Stremio is also installed).
+- **Key Architectural Takeaway:** `enginefs/src/backend/librqbit.rs` demonstrates that **`librqbit`** (pure Rust, Apache-2.0) provides mature DHT, tracker comms, magnet metadata resolution, single-file filtering, and a seek-aware async `FileStream` with zero C++ `libtorrent`/Boost or UnRAR dependencies.
+
+### 4.3 SeasonFetch's Embedded Implementation
+SeasonFetch embeds `librqbit 8.1.1` directly inside the standalone, Tauri-free **`crates/seasonfetch-streaming`** crate:
+- **Zero external apps or runtimes:** Users never need Stremio, qBittorrent, Node.js, or port `11470`.
+- **Loopback-only HTTP Range Server (`http_server.rs`):** Binds to `127.0.0.1:0` (ephemeral loopback port) and handles `HEAD`, `200 OK`, `206 Partial Content` (open-ended, bounded, and suffix ranges), `416 Range Not Satisfiable`, and immediate cancellation on close.
+- **Cross-Platform Sparse Chunked Storage (`storage.rs`):** Implements `librqbit::storage::TorrentStorage` using independent **2 MiB block files** (`f{file_id}_c{chunk:06}.blk`) with a bounded 32-handle LRU pool. Seeking to byte 6.37 GB (e.g., MKV `Cues` or mid-movie scrub) allocates <= 2 MiB instead of triggering multi-GB Windows NTFS zero-fill (`os error 112`), enabling streaming of multi-GB movies even on low-disk Windows machines or Android devices.
+- **Season-Pack File Selection & Tail Pre-Warming (`lib.rs`):** Honors Torrentio's `fileIdx` (or matches `SxxExx` / largest video file), restricts download exclusively to the selected file (`update_only_files`), pre-warms the container tail in parallel, and emits live `stream-session-status` events (peers, speed, buffered %, state).
+- **Guaranteed Cleanup:** Closing `PlayerOverlay`, switching episodes, or exiting SeasonFetch aborts active HTTP streams immediately, stops `libmpv`, closes all sparse storage file handles, deletes the torrent from `librqbit`, and removes the temporary session folder cleanly (verified: `168.4 MB / 100 chunks → 0 items / 0 bytes`).
+
+---
+
+## 5. Security & Release Pipeline
 - **Auth tokens:** Windows DPAPI (`CryptProtectData` / `CryptUnprotectData`), never plaintext.
 - **API & Protocol boundary:** Strict `/api/*` route allowlist and `magnet:`/`https:`/`ms-settings:defaultapps` validation in `crates/seasonfetch-core`.
-- **CI Release Workflow:** `.github/workflows/release-windows-tauri.yml` fetches `libmpv-2.dll` via `scripts/fetch-libmpv.ps1`, runs `cargo test -p seasonfetch-core`, `cargo check -p seasonfetch-desktop`, and `npm test`, builds the Windows NSIS installer + Ed25519 `.sig`, and publishes to `rightcodes1/SeasonFetch-Desktop-Releases`.
+- **CI Release Workflow:** `.github/workflows/release-windows-tauri.yml` fetches `libmpv-2.dll` via `scripts/fetch-libmpv.ps1`, runs `cargo test -p seasonfetch-core`, `cargo test -p seasonfetch-streaming`, `cargo check -p seasonfetch-desktop`, and `npm test`, builds the Windows NSIS installer + Ed25519 `.sig`, and publishes to `rightcodes1/SeasonFetch-Desktop-Releases`.

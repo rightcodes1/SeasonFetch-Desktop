@@ -12,6 +12,12 @@ Directly reusable on Android via UniFFI / JNI / Tauri Mobile:
   - `NativePlayerState`, `NativeLoadRequest`, `MediaTrack`, `PlaybackProgressRecord`, `upsert_playback_progress`, `select_best_engine`.
   - Shared resume thresholds (`>= 92%` completed), speed memory, subtitle delay/position preferences, and next-episode metadata.
 
+## 1.5 Shared Streaming Layer (`crates/seasonfetch-streaming`)
+The embedded BitTorrent streaming engine is intentionally isolated from Tauri and Win32 in its own pure-Rust workspace crate (`crates/seasonfetch-streaming`), making it directly embeddable inside a future Android foreground streaming service (via UniFFI / JNI):
+- Uses `librqbit` with pure-Rust `rust-tls` on non-Windows targets (`cfg(not(windows))`), avoiding OpenSSL / Boost / C++ `libtorrent` Android NDK complexity.
+- Uses cross-platform 2 MiB `SparseChunkStorage`, working cleanly inside Android's app cache directory (`context.cacheDir`) with minimal storage footprint even when streaming large 1080p/4K MKV files.
+- Serves `http://127.0.0.1:<ephemeral_port>/stream/...` with HTTP `206 Partial Content` range support, which Android **Media3 / ExoPlayer** and optional **`libmpv.so`** consume natively with zero Android-specific BitTorrent glue.
+
 ## 2. Android Native Playback Engines (Platform-Specific Rendering)
 Desktop Win32 HWND (`win32_surface.rs`) and `libmpv-2.dll` are **strictly isolated inside `src-tauri/src/native_player/`** and never leaked into `crates/seasonfetch-core`.
 

@@ -1,0 +1,23 @@
+[package]
+name = "seasonfetch-streaming"
+version = "0.1.0"
+edition = "2021"
+description = "Reusable pure-Rust BitTorrent-to-HTTP Range streaming engine for SeasonFetch Desktop and future Android clients."
+license = "UNLICENSED"
+
+[dependencies]
+seasonfetch-core = { path = "../seasonfetch-core" }
+anyhow = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "net", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["io"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+url = "2"
+
+[target.'cfg(windows)'.dependencies]
+librqbit = { version = "8.1.1", default-features = false, features = ["default-tls"] }
+
+[target.'cfg(not(windows))'.dependencies]
+librqbit = { version = "8.1.1", default-features = false, features = ["rust-tls"] }

@@ -4,6 +4,7 @@ use seasonfetch_core::player::{select_best_engine, PlaybackBackendInfo, Playback
 use seasonfetch_core::streaming::{
     resolve_playback_source, ResolvedPlaybackSource, StreamingEngineStatus, STREMIO_LOCAL_ORIGIN,
 };
+use seasonfetch_streaming::TorrentStreamingEngine;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::process::Command;
@@ -209,37 +210,78 @@ pub async fn probe_stremio_service() -> bool {
     }
 }
 
-pub async fn get_streaming_engine_status() -> StreamingEngineStatus {
+pub async fn get_streaming_engine_status(
+    streaming: Option<&TorrentStreamingEngine>,
+) -> StreamingEngineStatus {
     let stremio_up = probe_stremio_service().await;
+    if let Some(engine) = streaming {
+        let active_session = engine.current_status().await;
+        let cache_size = engine.cache_size_bytes().await;
+        let has_active = !matches!(
+            active_session.state,
+            seasonfetch_core::streaming::StreamSessionState::Idle
+                | seasonfetch_core::streaming::StreamSessionState::Stopped
+        );
+        return StreamingEngineStatus {
+            integrated_torrent_engine_active: true,
+            engine_name: "SeasonFetch Embedded Torrent Engine (librqbit)".to_string(),
+            local_http_origin: Some(engine.local_origin().to_string()),
+            stremio_service_reachable: stremio_up,
+            stremio_service_origin: STREMIO_LOCAL_ORIGIN.to_string(),
+            active_session: if has_active {
+                Some(active_session)
+            } else {
+                None
+            },
+            cache_dir: Some(engine.cache_dir().to_string_lossy().to_string()),
+            cache_size_bytes: cache_size,
+            capabilities: vec![
+                "Built-in BitTorrent magnet streaming (DHT + trackers + metadata resolution)".to_string(),
+                "Local loopback HTTP Range (206) streaming & seeking without downloading full file".to_string(),
+                "Automatic episode file selection & single-file filtering for season packs".to_string(),
+                "Direct embedded libmpv playback (MKV, HEVC, AV1, AC3/DTS, styled ASS/SSA libass)".to_string(),
+                "Automatic session teardown and temporary cache cleanup on close".to_string(),
+            ],
+            limitations: vec![
+                "Torrents with zero reachable seeders cannot stream until peers become available.".to_string(),
+            ],
+        };
+    }
+
     StreamingEngineStatus {
-        integrated_torrent_engine_active: stremio_up,
+        integrated_torrent_engine_active: false,
         engine_name: if stremio_up {
-            "Local Torrent Streaming Bridge (127.0.0.1:11470)".to_string()
+            "External Local Torrent Bridge (127.0.0.1:11470)".to_string()
         } else {
-            "Direct HTTP/HTTPS & Local File Playback (No local torrent streaming daemon running)".to_string()
+            "Direct HTTP/HTTPS & Local File Playback".to_string()
         },
+        local_http_origin: None,
         stremio_service_reachable: stremio_up,
         stremio_service_origin: STREMIO_LOCAL_ORIGIN.to_string(),
+        active_session: None,
+        cache_dir: None,
+        cache_size_bytes: 0,
         capabilities: vec![
             "Local media files (MP4, MKV, WebM, MOV)".to_string(),
             "Direct HTTP/HTTPS video streams".to_string(),
             "Styled ASS/SSA, SRT, and WebVTT anime subtitles".to_string(),
-            "Optional local torrent streaming bridge on 127.0.0.1:11470".to_string(),
             "OS-standard magnet: handoff to external download clients".to_string(),
         ],
-        limitations: if stremio_up {
-            vec!["Torrent streaming is delegated to the local streaming daemon on port 11470.".to_string()]
-        } else {
-            vec![
-                "Raw magnet URIs require a BitTorrent streaming daemon (piece selection, sequential buffering, peer management) to play directly without downloading first.".to_string(),
-                "Start Stremio Service on port 11470 for instant torrent streaming, or use Open Magnet Externally and play the local file inside SeasonFetch.".to_string(),
-            ]
-        },
+        limitations: vec![
+            "Embedded torrent streaming engine failed to initialize on this launch.".to_string(),
+        ],
     }
 }
 
-pub async fn resolve_source_command(args: ResolveSourceArgs) -> ResolvedPlaybackSource {
-    let stremio_up = probe_stremio_service().await;
+pub async fn resolve_source_command(
+    args: ResolveSourceArgs,
+    embedded_engine_ready: bool,
+) -> ResolvedPlaybackSource {
+    let stremio_up = if embedded_engine_ready {
+        false
+    } else {
+        probe_stremio_service().await
+    };
     resolve_playback_source(
         &args.title,
         args.direct_url.as_deref(),
@@ -247,6 +289,7 @@ pub async fn resolve_source_command(args: ResolveSourceArgs) -> ResolvedPlayback
         args.magnet_uri.as_deref(),
         args.info_hash.as_deref(),
         args.file_idx,
+        embedded_engine_ready,
         stremio_up,
     )
 }

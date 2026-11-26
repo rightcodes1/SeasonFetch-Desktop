@@ -462,7 +462,10 @@ impl EmbeddedLibMpv {
                 let _ = syms.set_opt_str(ctx, "sub-ass", "yes");
                 let _ = syms.set_opt_str(ctx, "sub-font-provider", "auto");
                 let _ = syms.set_opt_str(ctx, "hwdec", "auto-safe");
+                let _ = syms.set_opt_str(ctx, "cache", "yes");
+                let _ = syms.set_opt_str(ctx, "network-timeout", "60");
                 let _ = syms.set_opt_str(ctx, "demuxer-max-bytes", "150MiB");
+                let _ = syms.set_opt_str(ctx, "demuxer-readahead-secs", "20");
                 let _ = syms.set_opt_str(
                     ctx,
                     "demuxer-lavf-o",

@@ -15,6 +15,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 seasonfetch-core = { path = "../crates/seasonfetch-core" }
+seasonfetch-streaming = { path = "../crates/seasonfetch-streaming" }
 tauri = { version = "2", features = ["tray-icon", "protocol-asset"] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"

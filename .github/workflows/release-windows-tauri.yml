@@ -113,6 +113,7 @@ jobs:
       - name: Run Rust & JS unit tests
         run: |
           cargo test -p seasonfetch-core
+          cargo test -p seasonfetch-streaming
           cargo check -p seasonfetch-desktop
           npm test
 

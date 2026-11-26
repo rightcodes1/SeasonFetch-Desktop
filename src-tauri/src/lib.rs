@@ -24,11 +24,13 @@ use seasonfetch_core::player::{
     NativeEngineActionResult, NativeLoadRequest, NativePlayerState, PlaybackBackendInfo,
     PlaybackProgressRecord,
 };
-use seasonfetch_core::streaming::{ResolvedPlaybackSource, StreamingEngineStatus};
+use seasonfetch_core::streaming::{ResolvedPlaybackSource, StreamSessionStatus, StreamingEngineStatus};
+use seasonfetch_streaming::{StartTorrentRequest, StatusCallback, TorrentStreamingEngine};
 use serde::Serialize;
 use serde_json::Value;
 use settings::SettingsManager;
 use std::fs;
+use std::sync::Arc;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -43,6 +45,7 @@ struct AppState {
     logger: DesktopLogger,
     updater: UpdaterManager,
     native_player: NativePlaybackManager,
+    streaming: Option<TorrentStreamingEngine>,
 }
 
 #[derive(Debug, Serialize)]
@@ -162,6 +165,9 @@ fn settings_update(patch: Value, app: AppHandle, state: State<'_, AppState>) -> 
                 updated.auto_check_updates,
                 updated.auto_download_updates,
             );
+            if let Some(streaming) = &state.streaming {
+                streaming.set_cache_max_mb(updated.cache_max_mb as u64);
+            }
             serde_json::json!({ "ok": true, "settings": updated })
         }
         Err(error) => serde_json::json!({ "ok": false, "error": error }),
@@ -249,13 +255,92 @@ fn native_player_get_state(state: State<'_, AppState>) -> NativePlayerState {
 }
 
 #[tauri::command]
-async fn get_streaming_status() -> StreamingEngineStatus {
-    get_streaming_engine_status().await
+async fn get_streaming_status(state: State<'_, AppState>) -> Result<StreamingEngineStatus, String> {
+    Ok(get_streaming_engine_status(state.streaming.as_ref()).await)
 }
 
 #[tauri::command]
-async fn resolve_playback(args: ResolveSourceArgs) -> ResolvedPlaybackSource {
-    resolve_source_command(args).await
+async fn resolve_playback(
+    args: ResolveSourceArgs,
+    state: State<'_, AppState>,
+) -> Result<ResolvedPlaybackSource, String> {
+    Ok(resolve_source_command(args, state.streaming.is_some()).await)
+}
+
+#[tauri::command]
+async fn stream_start_torrent(
+    request: StartTorrentRequest,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<StreamSessionStatus, String> {
+    let Some(engine) = state.streaming.clone() else {
+        return Err("Embedded torrent streaming engine is not available.".to_string());
+    };
+    let app_clone = app.clone();
+    let cb: StatusCallback = Arc::new(move |status: StreamSessionStatus| {
+        let _ = app_clone.emit("stream-session-status", &status);
+    });
+    state.logger.info(
+        "streaming",
+        &format!(
+            "Starting embedded torrent stream for '{}' (fileIdx={:?})",
+            request.title, request.file_idx
+        ),
+    );
+    let res = engine.start_stream(request, Some(cb)).await;
+    match &res {
+        Ok(status) => state.logger.info(
+            "streaming",
+            &format!(
+                "Torrent metadata ready: session={} file={:?} bytes={} url={:?}",
+                status.session_id, status.file_name, status.total_bytes, status.stream_url
+            ),
+        ),
+        Err(err) => state.logger.warn("streaming", &format!("Torrent stream start failed: {err}")),
+    }
+    res
+}
+
+#[tauri::command]
+async fn stream_stop_session(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<StreamSessionStatus, String> {
+    let Some(engine) = state.streaming.clone() else {
+        return Ok(StreamSessionStatus::idle());
+    };
+    let app_clone = app.clone();
+    let cb: StatusCallback = Arc::new(move |status: StreamSessionStatus| {
+        let _ = app_clone.emit("stream-session-status", &status);
+    });
+    let status = engine.stop_active_session(Some(cb)).await;
+    state
+        .logger
+        .info("streaming", "Stopped active torrent session and cleaned temporary cache");
+    Ok(status)
+}
+
+#[tauri::command]
+async fn stream_get_status(state: State<'_, AppState>) -> Result<StreamSessionStatus, String> {
+    if let Some(engine) = &state.streaming {
+        Ok(engine.current_status().await)
+    } else {
+        Ok(StreamSessionStatus::idle())
+    }
+}
+
+#[tauri::command]
+async fn stream_clear_cache(state: State<'_, AppState>) -> Result<Value, String> {
+    if let Some(engine) = &state.streaming {
+        let freed = engine.clear_cache().await?;
+        state.logger.info(
+            "streaming",
+            &format!("Cleared embedded torrent stream cache ({freed} bytes freed)"),
+        );
+        Ok(serde_json::json!({ "ok": true, "freedBytes": freed }))
+    } else {
+        Ok(serde_json::json!({ "ok": true, "freedBytes": 0 }))
+    }
 }
 
 #[tauri::command]
@@ -380,7 +465,7 @@ async fn get_diagnostics(app: AppHandle, state: State<'_, AppState>) -> Result<V
     let settings = state.settings.get();
     let magnet = inspect_windows_magnet_handler();
     let player = get_playback_backend_info(&settings.player, &state.native_player);
-    let streaming = get_streaming_engine_status().await;
+    let streaming = get_streaming_engine_status(state.streaming.as_ref()).await;
     let updater_state = state.updater.get_state();
     let (catalog_entries, meta_entries) = state.api.cache_stats();
 
@@ -493,6 +578,31 @@ pub fn run() {
                 ),
             );
 
+            let streaming_cache_dir = app_data_dir.join("stream-cache");
+            let streaming = match tauri::async_runtime::block_on(TorrentStreamingEngine::start(
+                streaming_cache_dir.clone(),
+                initial_settings.cache_max_mb as u64,
+            )) {
+                Ok(engine) => {
+                    logger.info(
+                        "streaming",
+                        &format!(
+                            "Embedded torrent streaming engine ready on {} (cache: {})",
+                            engine.local_origin(),
+                            streaming_cache_dir.display()
+                        ),
+                    );
+                    Some(engine)
+                }
+                Err(err) => {
+                    logger.warn(
+                        "streaming",
+                        &format!("Embedded torrent streaming engine failed to start: {err}"),
+                    );
+                    None
+                }
+            };
+
             app.manage(AppState {
                 api: ApiBridge::new(),
                 auth,
@@ -500,6 +610,7 @@ pub fn run() {
                 logger,
                 updater: updater_mgr,
                 native_player,
+                streaming,
             });
 
             // Optional diagnostic CLI trigger: `--diag-play <path> [--diag-engine <id>] [--diag-hwdec <0|1>] [--diag-sub <path>]`
@@ -565,6 +676,98 @@ pub fn run() {
                             );
                             for line in st.native_player.recent_logs() {
                                 st.logger.info("mpv_log", &line);
+                            }
+                        }
+                    });
+                }
+            }
+
+            // Optional diagnostic CLI trigger: `--diag-magnet <magnet> [--diag-file-idx <N>] [--diag-title <name>]`
+            // Exercises the complete real Stremio-like torrent streaming -> embedded libmpv pipeline inside the live Tauri window.
+            if let Some(pos) = cli_args.iter().position(|a| a == "--diag-magnet") {
+                if let Some(magnet_uri) = cli_args.get(pos + 1).cloned() {
+                    let diag_file_idx = cli_args
+                        .iter()
+                        .position(|a| a == "--diag-file-idx")
+                        .and_then(|i| cli_args.get(i + 1))
+                        .and_then(|v| v.parse::<usize>().ok());
+                    let diag_title = cli_args
+                        .iter()
+                        .position(|a| a == "--diag-title")
+                        .and_then(|i| cli_args.get(i + 1))
+                        .cloned()
+                        .unwrap_or_else(|| "Diagnostic Torrent Stream".to_string());
+                    let diag_seek_secs = cli_args
+                        .iter()
+                        .position(|a| a == "--diag-seek")
+                        .and_then(|i| cli_args.get(i + 1))
+                        .and_then(|v| v.parse::<f64>().ok());
+                    let app_handle = app.handle().clone();
+                    tauri::async_runtime::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        if let Some(win) = app_handle.get_webview_window("main") {
+                            let _ = win.emit(
+                                "desktop-navigate",
+                                serde_json::json!({
+                                    "diagMagnet": {
+                                        "magnetUri": magnet_uri,
+                                        "fileIdx": diag_file_idx,
+                                        "title": diag_title
+                                    }
+                                }),
+                            );
+                        }
+                        // Poll up to 80s for live playback + optional seek test
+                        let mut sought = false;
+                        for step in 0..80 {
+                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                            let Some(st) = app_handle.try_state::<AppState>() else {
+                                break;
+                            };
+                            let snap = st.native_player.state();
+                            let stream_snap = if let Some(eng) = &st.streaming {
+                                Some(eng.current_status().await)
+                            } else {
+                                None
+                            };
+                            if step % 3 == 0 || (snap.playing && snap.vo_configured) {
+                                st.logger.info(
+                                    "diag_torrent",
+                                    &format!(
+                                        "T+{step}s stream={:?} s_err={:?} peers={} dl_bps={} progress={:.2}% http={} | mpv active={} playing={} vo={} codec={:?}/{:?} res={}x{} hwdec={:?} fps={:.2} pos={:.2}/{:.2} audio={} subs={} err={:?}",
+                                        stream_snap.as_ref().map(|s| &s.state),
+                                        stream_snap.as_ref().and_then(|s| s.error.as_deref()),
+                                        stream_snap.as_ref().map(|s| s.peers_connected).unwrap_or(0),
+                                        stream_snap.as_ref().map(|s| s.download_speed_bps).unwrap_or(0),
+                                        stream_snap.as_ref().map(|s| s.progress_percent).unwrap_or(0.0),
+                                        stream_snap.as_ref().map(|s| s.active_http_streams).unwrap_or(0),
+                                        snap.active,
+                                        snap.playing,
+                                        snap.vo_configured,
+                                        snap.video_codec,
+                                        snap.audio_codec,
+                                        snap.video_width,
+                                        snap.video_height,
+                                        snap.hwdec_current,
+                                        snap.estimated_fps,
+                                        snap.position_secs,
+                                        snap.duration_secs,
+                                        snap.audio_tracks.len(),
+                                        snap.subtitle_tracks.len(),
+                                        snap.error
+                                    ),
+                                );
+                            }
+                            if !sought && snap.playing && snap.vo_configured && snap.duration_secs > 30.0 {
+                                if let Some(seek_to) = diag_seek_secs {
+                                    sought = true;
+                                    let clamped = seek_to.min(snap.duration_secs * 0.75);
+                                    st.logger.info(
+                                        "diag_torrent",
+                                        &format!("SEEK_REQUEST target={:.1}s duration={:.1}s", clamped, snap.duration_secs),
+                                    );
+                                    let _ = st.native_player.command("seek_absolute", serde_json::json!(clamped));
+                                }
                             }
                         }
                     });
@@ -641,6 +844,15 @@ pub fn run() {
                                 }
                             }
                             "quit" => {
+                                if let Some(st) = app_handle.try_state::<AppState>() {
+                                    if let Some(engine) = &st.streaming {
+                                        engine.abort_http_streams_sync();
+                                    }
+                                    let _ = st.native_player.stop();
+                                    if let Some(engine) = &st.streaming {
+                                        engine.fast_cleanup_sync();
+                                    }
+                                }
                                 app_handle.exit(0);
                             }
                             _ => {}
@@ -664,8 +876,22 @@ pub fn run() {
                     }
                     tauri::WindowEvent::CloseRequested { api, .. } => {
                         if let Some(st) = app_handle.try_state::<AppState>() {
+                            // Abort HTTP streams FIRST so libmpv unblocks its network reader in <1ms
+                            if let Some(engine) = &st.streaming {
+                                engine.abort_http_streams_sync();
+                            }
                             let _ = st.native_player.stop();
-                            if st.settings.get().minimize_to_tray {
+                            if let Some(engine) = st.streaming.clone() {
+                                if st.settings.get().minimize_to_tray {
+                                    tauri::async_runtime::spawn(async move {
+                                        let _ = engine.stop_active_session(None).await;
+                                    });
+                                    api.prevent_close();
+                                    let _ = win_clone.hide();
+                                } else {
+                                    engine.fast_cleanup_sync();
+                                }
+                            } else if st.settings.get().minimize_to_tray {
                                 api.prevent_close();
                                 let _ = win_clone.hide();
                             }
@@ -703,6 +929,10 @@ pub fn run() {
             native_player_get_state,
             get_streaming_status,
             resolve_playback,
+            stream_start_torrent,
+            stream_stop_session,
+            stream_get_status,
+            stream_clear_cache,
             launch_mpv,
             pick_local_media_file,
             pick_subtitle_file,

@@ -4,11 +4,14 @@ import {
   Cpu,
   ExternalLink,
   FastForward,
+  Loader2,
+  Magnet,
   Maximize,
   Minimize,
   Pause,
   PictureInPicture2,
   Play,
+  Radio,
   Rewind,
   Settings2,
   SkipForward,
@@ -28,7 +31,10 @@ import {
   nativePlayerStop,
   pickSubtitleFile,
   savePlaybackProgress,
+  startTorrentStream,
+  stopTorrentStream,
   subscribeNativePlayerState,
+  subscribeStreamSessionStatus,
   toPlayableAssetUrl,
   windowControls
 } from '../services/desktopApi.js';
@@ -78,11 +84,25 @@ function resolveInitialEngine(playerPrefs, playerBackend) {
   return 'webview';
 }
 
+function formatSpeedBps(bps) {
+  if (!Number.isFinite(bps) || bps <= 0) return '0 KB/s';
+  if (bps >= 1024 * 1024) return `${(bps / (1024 * 1024)).toFixed(1)} MB/s`;
+  return `${Math.round(bps / 1024)} KB/s`;
+}
+
+function formatSizeCompact(bytes) {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '';
+  if (bytes >= 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${Math.round(bytes / 1024)} KB`;
+}
+
 export function PlayerOverlay({
-  session, // { mediaKey, title, subtitle, streamUrl, rawPath, imdbId, mediaType, season, episode, resumeSecs, nextEpisode }
+  session, // { mediaKey, title, subtitle, streamUrl, rawPath, magnetUri, torrentRequest, imdbId, mediaType, season, episode, resumeSecs, nextEpisode }
   playerPrefs,
   playerBackend,
   onUpdatePlayerPrefs,
+  onOpenMagnet,
   onPlayNextEpisode,
   onClose,
   onToast
@@ -139,8 +159,75 @@ export function PlayerOverlay({
   const [webAudioTracks, setWebAudioTracks] = useState([]);
   const [selectedWebAudioIdx, setSelectedWebAudioIdx] = useState(0);
 
-  const rawTarget = session?.rawPath || session?.streamUrl || '';
-  const playableSrc = useMemo(() => toPlayableAssetUrl(session?.streamUrl || session?.rawPath), [session]);
+  // Embedded BitTorrent streaming session state (Stremio-like workflow)
+  const isTorrentSession = Boolean(session?.torrentRequest);
+  const [resolvedTorrentUrl, setResolvedTorrentUrl] = useState(null);
+  const [streamStatus, setStreamStatus] = useState(null);
+  const [streamRetryTick, setStreamRetryTick] = useState(0);
+
+  const rawTarget = session?.rawPath || resolvedTorrentUrl || session?.streamUrl || '';
+  const playableSrc = useMemo(
+    () => toPlayableAssetUrl(resolvedTorrentUrl || session?.streamUrl || session?.rawPath),
+    [resolvedTorrentUrl, session]
+  );
+
+  // Start & clean up embedded BitTorrent streaming session when playing a Torrentio magnet release
+  useEffect(() => {
+    if (!session?.torrentRequest) {
+      setResolvedTorrentUrl(null);
+      setStreamStatus(null);
+      return undefined;
+    }
+
+    let cancelled = false;
+    setResolvedTorrentUrl(null);
+    setVideoError('');
+    setBuffering(true);
+    setStreamStatus({
+      state: 'resolvingMetadata',
+      title: session.torrentRequest.title || session.title,
+      peersConnected: 0,
+      peersSeen: 0,
+      downloadSpeedBps: 0,
+      progressPercent: 0,
+      totalBytes: 0,
+      statusMessage: 'Connecting to peers and resolving torrent metadata...'
+    });
+
+    const unsubStream = subscribeStreamSessionStatus(nextStatus => {
+      if (cancelled || !nextStatus) return;
+      setStreamStatus(nextStatus);
+      if (nextStatus.state === 'error' && nextStatus.error) {
+        setVideoError(nextStatus.error);
+        setBuffering(false);
+      }
+    });
+
+    startTorrentStream(session.torrentRequest)
+      .then(ready => {
+        if (cancelled) return;
+        setStreamStatus(ready);
+        if (ready?.streamUrl) {
+          setResolvedTorrentUrl(ready.streamUrl);
+        } else {
+          setBuffering(false);
+          setVideoError('Embedded streaming engine resolved metadata without a playable stream URL.');
+        }
+      })
+      .catch(err => {
+        if (cancelled) return;
+        setBuffering(false);
+        const msg = typeof err === 'string' ? err : err?.message || 'Unable to start embedded torrent stream.';
+        setStreamStatus(prev => ({ ...(prev || {}), state: 'error', statusMessage: msg, error: msg }));
+        setVideoError(msg);
+      });
+
+    return () => {
+      cancelled = true;
+      unsubStream();
+      stopTorrentStream().catch(() => {});
+    };
+  }, [session?.mediaKey, session?.torrentRequest, streamRetryTick]);
 
   const persistProgress = useCallback((pos, dur) => {
     if (!session?.mediaKey || !dur || dur <= 0) return;
@@ -405,6 +492,10 @@ export function PlayerOverlay({
   }, [isNativeEngine, onUpdatePlayerPrefs]);
 
   const handleClosePlayer = useCallback(async () => {
+    if (isTorrentSession) {
+      // Stop torrent stream alongside native player so HTTP sockets release immediately
+      stopTorrentStream().catch(() => {});
+    }
     if (isNativeEngine) {
       const { pos, dur } = latestPosRef.current;
       if (dur > 0) persistProgress(pos, dur);
@@ -415,11 +506,14 @@ export function PlayerOverlay({
         persistProgress(video.currentTime, video.duration);
       }
     }
+    if (isTorrentSession) {
+      await stopTorrentStream().catch(() => {});
+    }
     if (fullscreen) {
       await windowControls.setFullscreen(false).catch(() => {});
     }
     onClose?.();
-  }, [fullscreen, isNativeEngine, onClose, persistProgress]);
+  }, [fullscreen, isNativeEngine, isTorrentSession, onClose, persistProgress]);
 
   useEffect(() => {
     const handleKey = event => {
@@ -576,7 +670,7 @@ export function PlayerOverlay({
 
   return (
     <div
-      className={`sf-player-overlay ${isNativeEngine ? 'is-native-surface' : ''} ${hudVisible || !playing ? 'hud-open' : 'hud-hidden'}`}
+      className={`sf-player-overlay ${isNativeEngine ? 'is-native-surface' : ''} ${!rawTarget ? 'is-preloading' : ''} ${hudVisible || !playing ? 'hud-open' : 'hud-hidden'}`}
       onMouseMove={revealHud}
     >
       {/* Interactive transparent click surface when native libmpv/libVLC renders beneath WebView2 */}
@@ -585,11 +679,42 @@ export function PlayerOverlay({
           className="sf-native-stage"
           onClick={() => {
             if (activeDrawer) setActiveDrawer(null);
-            else togglePlay();
+            else if (rawTarget) togglePlay();
           }}
           onDoubleClick={toggleFullscreen}
         >
-          {buffering && !videoError && (
+          {isTorrentSession && !videoError && (!rawTarget || (buffering && !playing)) ? (
+            <div className="sf-stream-buffering-card" onClick={e => e.stopPropagation()}>
+              <div className="sf-stream-buffering-head">
+                <Loader2 size={18} className="sf-spin" />
+                <div>
+                  <strong>
+                    {!rawTarget ? 'Starting Torrent Stream' : 'Buffering Video Stream'}
+                  </strong>
+                  <span>{streamStatus?.statusMessage || 'Connecting to peers...'}</span>
+                </div>
+              </div>
+              {streamStatus?.fileName && (
+                <div className="sf-stream-file-line">
+                  <span>{streamStatus.fileName}</span>
+                  {streamStatus.totalBytes > 0 && (
+                    <span className="sf-mono-sm">{formatSizeCompact(streamStatus.totalBytes)}</span>
+                  )}
+                </div>
+              )}
+              <div className="sf-stream-metrics-row">
+                <span>Peers: <strong>{streamStatus?.peersConnected ?? 0}</strong>{streamStatus?.peersSeen ? ` / ${streamStatus.peersSeen} seen` : ''}</span>
+                <span>Speed: <strong>{formatSpeedBps(streamStatus?.downloadSpeedBps || 0)}</strong></span>
+                <span>Buffered: <strong>{(streamStatus?.progressPercent || 0).toFixed(1)}%</strong></span>
+              </div>
+              <div className="sf-stream-progress-track">
+                <div
+                  className={`sf-stream-progress-fill ${!rawTarget ? 'is-indeterminate' : ''}`}
+                  style={{ width: rawTarget ? `${Math.max(4, Math.min(100, streamStatus?.progressPercent || 4))}%` : '38%' }}
+                />
+              </div>
+            </div>
+          ) : buffering && !videoError && (
             <div className="sf-player-buffering-pill">
               <Cpu size={14} /> Initializing {engineLabel} native decoder...
             </div>
@@ -682,10 +807,34 @@ export function PlayerOverlay({
 
       {videoError && (
         <div className="sf-player-error-card" onClick={e => e.stopPropagation()}>
-          <h3>Playback decoder notice</h3>
+          <h3>{isTorrentSession && !rawTarget ? 'Torrent stream unavailable' : 'Playback decoder notice'}</h3>
           <p>{videoError}</p>
           <div className="sf-btn-row">
-            {activeEngine !== 'embedded-libmpv' && playerBackend?.libmpvAvailable && (
+            {isTorrentSession && (
+              <button
+                type="button"
+                className="sf-primary-btn"
+                onClick={() => {
+                  setVideoError('');
+                  setStreamRetryTick(n => n + 1);
+                }}
+              >
+                Retry Stream
+              </button>
+            )}
+            {session?.magnetUri && onOpenMagnet && (
+              <button
+                type="button"
+                className="sf-secondary-btn"
+                onClick={() => {
+                  onOpenMagnet(session.magnetUri, session.title);
+                  handleClosePlayer();
+                }}
+              >
+                <Magnet size={14} /> Open Magnet Externally
+              </button>
+            )}
+            {rawTarget && activeEngine !== 'embedded-libmpv' && playerBackend?.libmpvAvailable && (
               <button
                 type="button"
                 className="sf-primary-btn"
@@ -697,7 +846,7 @@ export function PlayerOverlay({
                 Switch to Embedded libmpv
               </button>
             )}
-            {isNativeEngine && hwdecEnabled && (
+            {rawTarget && isNativeEngine && hwdecEnabled && (
               <button
                 type="button"
                 className="sf-secondary-btn"
@@ -709,7 +858,7 @@ export function PlayerOverlay({
                 Retry with Software Decoding
               </button>
             )}
-            {playerBackend?.mpvAvailable && (
+            {rawTarget && playerBackend?.mpvAvailable && (
               <button type="button" className="sf-ghost-btn" onClick={handleLaunchExternalMpv}>
                 <ExternalLink size={14} /> Open External MPV
               </button>
@@ -732,10 +881,15 @@ export function PlayerOverlay({
           {session?.subtitle && <span>{session.subtitle}</span>}
         </div>
         <div className="sf-player-top-actions">
+          {isTorrentSession && streamStatus && (
+            <span className="sf-stream-pill" title={streamStatus.fileName || 'Embedded Torrent Engine'}>
+              <Radio size={12} /> {streamStatus.peersConnected ?? 0} peers · {formatSpeedBps(streamStatus.downloadSpeedBps || 0)}
+            </span>
+          )}
           <span className="sf-engine-badge" title="Active native playback engine and hardware decoder status">
             <Cpu size={12} /> {codecSummary}
           </span>
-          {playerBackend?.mpvAvailable && (
+          {rawTarget && playerBackend?.mpvAvailable && (
             <button
               type="button"
               className="sf-player-pill-btn"

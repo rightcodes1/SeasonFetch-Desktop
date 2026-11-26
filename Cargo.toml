@@ -2,5 +2,6 @@
 resolver = "2"
 members = [
   "crates/seasonfetch-core",
+  "crates/seasonfetch-streaming",
   "src-tauri",
 ]

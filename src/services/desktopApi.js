@@ -338,11 +338,46 @@ export async function getStreamingStatus() {
   return {
     integratedTorrentEngineActive: false,
     engineName: 'Direct HTTP/HTTPS & Local File Playback',
+    localHttpOrigin: null,
     stremioServiceReachable: false,
     stremioServiceOrigin: 'http://127.0.0.1:11470',
+    activeSession: null,
+    cacheDir: null,
+    cacheSizeBytes: 0,
     capabilities: ['Direct HTTP/HTTPS video streams', 'Styled ASS/SSA, SRT, WebVTT subtitles'],
-    limitations: ['Raw magnet URIs require a local torrent streaming bridge or external download client.']
+    limitations: ['Embedded torrent streaming requires the SeasonFetch Tauri desktop runtime.']
   };
+}
+
+export async function startTorrentStream(request) {
+  if (isTauriRuntime()) return invoke('stream_start_torrent', { request });
+  throw new Error('Embedded torrent streaming requires the SeasonFetch Desktop app.');
+}
+
+export async function stopTorrentStream() {
+  if (isTauriRuntime()) return invoke('stream_stop_session');
+  return { state: 'stopped' };
+}
+
+export async function getTorrentStreamStatus() {
+  if (isTauriRuntime()) return invoke('stream_get_status');
+  return { state: 'idle' };
+}
+
+export async function clearStreamCache() {
+  if (isTauriRuntime()) return invoke('stream_clear_cache');
+  return { ok: true, freedBytes: 0 };
+}
+
+export function subscribeStreamSessionStatus(callback) {
+  if (isTauriRuntime()) {
+    let unlisten = () => {};
+    listen('stream-session-status', event => callback(event.payload)).then(fn => {
+      unlisten = fn;
+    });
+    return () => unlisten();
+  }
+  return () => {};
 }
 
 export async function resolvePlaybackSource(args) {

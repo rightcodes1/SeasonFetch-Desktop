@@ -49,6 +49,7 @@ export function SettingsView({
   onRefreshCatalogs,
   onRefreshPlayerStatus,
   onClearCache,
+  onClearStreamCache,
   onClearHistory,
   onOpenExternal,
   onOpenAuth,
@@ -438,16 +439,23 @@ export function SettingsView({
 
               <div className="sf-setting-row">
                 <div className="sf-setting-copy">
-                  <strong>Local Torrent Bridge</strong>
+                  <strong>Embedded Torrent Streaming Engine</strong>
                   <p className="sf-muted-sm">
-                    {streamingStatus?.stremioServiceReachable
-                      ? `Connected on ${streamingStatus.stremioServiceOrigin}`
-                      : 'Not running on 127.0.0.1:11470'}
+                    {streamingStatus?.integratedTorrentEngineActive
+                      ? `Active (${streamingStatus.engineName}) on ${streamingStatus.localHttpOrigin || '127.0.0.1'} — no external app required.`
+                      : streamingStatus?.stremioServiceReachable
+                        ? `External bridge connected on ${streamingStatus.stremioServiceOrigin}`
+                        : 'Not initialized on this runtime'}
                   </p>
                 </div>
-                <button type="button" className="sf-ghost-btn sf-sm" onClick={onRefreshPlayerStatus}>
-                  Re-check
-                </button>
+                <div className="sf-btn-row">
+                  <span className={`sf-engine-pill ${streamingStatus?.integratedTorrentEngineActive ? 'is-ready' : ''}`}>
+                    {streamingStatus?.integratedTorrentEngineActive ? 'Built-in Ready' : 'Inactive'}
+                  </span>
+                  <button type="button" className="sf-ghost-btn sf-sm" onClick={onRefreshPlayerStatus}>
+                    Re-check
+                  </button>
+                </div>
               </div>
 
               <div className="sf-setting-row">
@@ -469,6 +477,17 @@ export function SettingsView({
           {currentId === 'storage' && (
             <div className="sf-panel">
               <h2>Storage &amp; Cache</h2>
+              <div className="sf-setting-row">
+                <div>
+                  <strong>Clear Torrent Stream Cache</strong>
+                  <p className="sf-muted-sm">
+                    Removes temporary streaming chunks (currently {((streamingStatus?.cacheSizeBytes || 0) / (1024 * 1024)).toFixed(1)} MB; automatically cleaned on close).
+                  </p>
+                </div>
+                <button type="button" className="sf-secondary-btn sf-sm" onClick={onClearStreamCache}>
+                  <HardDrive size={13} /> Clear Stream Cache
+                </button>
+              </div>
               <div className="sf-setting-row">
                 <div>
                   <strong>Clear Local Metadata &amp; Catalog Cache</strong>

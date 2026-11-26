@@ -1712,6 +1712,19 @@ select:focus-visible {
 }
 
 /* Built-in Cinema Media Player Overlay */
+html.sf-native-video-active,
+html.sf-native-video-active body,
+html.sf-native-video-active #root,
+html.sf-native-video-active .sf-app {
+  background: transparent !important;
+}
+
+html.sf-native-video-active .sf-titlebar,
+html.sf-native-video-active .sf-workspace {
+  visibility: hidden;
+  pointer-events: none;
+}
+
 .sf-player-overlay {
   position: fixed;
   inset: 0;
@@ -1721,6 +1734,108 @@ select:focus-visible {
   align-items: center;
   justify-content: center;
   overflow: hidden;
+}
+
+.sf-player-overlay.is-native-surface {
+  background: transparent !important;
+}
+
+.sf-native-stage {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  background: transparent;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.sf-player-buffering-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 16px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(11, 12, 16, 0.84);
+  color: var(--text-primary);
+  font-size: 13px;
+}
+
+.sf-engine-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(167, 139, 250, 0.35);
+  background: rgba(15, 17, 23, 0.78);
+  color: #dcd3ff;
+  font: 500 11px 'DM Mono', monospace;
+}
+
+.sf-track-list {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  max-height: 180px;
+  overflow-y: auto;
+}
+
+.sf-track-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 7px 10px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--text-secondary);
+  font-size: 12px;
+  text-align: left;
+}
+
+.sf-track-item:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text-primary);
+}
+
+.sf-track-item.is-active {
+  border-color: var(--accent);
+  background: var(--accent-bg);
+  color: #ffffff;
+  font-weight: 600;
+}
+
+.sf-engine-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 10px;
+  margin: 10px 0 14px;
+}
+
+.sf-engine-card {
+  padding: 12px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 10px;
+  background: var(--bg-elevated);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.sf-engine-card.is-ready {
+  border-color: rgba(110, 231, 183, 0.25);
+}
+
+.sf-engine-card-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
 }
 
 .sf-player-video {

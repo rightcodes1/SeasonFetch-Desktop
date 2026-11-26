@@ -2159,7 +2159,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6e9ec52138abedcc58dc17a7c6c0c00a2bdb4f3427c7f63fa97fd0d859155caf"
 dependencies = [
  "gtk-sys",
- "libloading",
+ "libloading 0.7.4",
  "once_cell",
 ]
 
@@ -2186,6 +2186,16 @@ checksum = "b67380fd3b2fbe7527a606e18729d21c6f3951633d0500574c4dc22d2d638b9f"
 dependencies = [
  "cfg-if",
  "winapi",
+]
+
+[[package]]
+name = "libloading"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if",
+ "windows-link",
 ]
 
 [[package]]
@@ -3545,6 +3555,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
+ "libloading 0.8.9",
  "reqwest 0.12.28",
  "seasonfetch-core",
  "serde",
@@ -3558,7 +3569,6 @@ dependencies = [
  "tauri-plugin-updater",
  "tokio",
  "url",
- "window-vibrancy 0.6.0",
  "windows-sys 0.59.0",
  "winreg 0.55.0",
 ]
@@ -4234,7 +4244,7 @@ dependencies = [
  "url",
  "webkit2gtk",
  "webview2-com",
- "window-vibrancy 0.8.1",
+ "window-vibrancy",
  "windows",
 ]
 
@@ -5316,21 +5326,6 @@ name = "winapi-x86_64-pc-windows-gnu"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
-
-[[package]]
-name = "window-vibrancy"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d9bec5a31f3f9362f2258fd0e9c9dd61a9ca432e7306cc78c444258f0dce9a9c"
-dependencies = [
- "objc2",
- "objc2-app-kit",
- "objc2-core-foundation",
- "objc2-foundation",
- "raw-window-handle",
- "windows-sys 0.59.0",
- "windows-version",
-]
 
 [[package]]
 name = "window-vibrancy"

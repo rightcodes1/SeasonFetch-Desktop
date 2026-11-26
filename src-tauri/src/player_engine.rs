@@ -1,5 +1,6 @@
+use crate::native_player::NativePlaybackManager;
 use seasonfetch_core::models::PlayerPreferences;
-use seasonfetch_core::player::PlaybackBackendInfo;
+use seasonfetch_core::player::{select_best_engine, PlaybackBackendInfo, PlaybackEngineOption};
 use seasonfetch_core::streaming::{
     resolve_playback_source, ResolvedPlaybackSource, StreamingEngineStatus, STREMIO_LOCAL_ORIGIN,
 };
@@ -80,22 +81,116 @@ pub fn detect_mpv_executable(configured_path: &str) -> Option<PathBuf> {
     None
 }
 
-pub fn get_playback_backend_info(prefs: &PlayerPreferences) -> PlaybackBackendInfo {
+pub fn detect_vlc_executable() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        let candidates = [
+            PathBuf::from("C:\\Program Files\\VideoLAN\\VLC\\vlc.exe"),
+            PathBuf::from("C:\\Program Files (x86)\\VideoLAN\\VLC\\vlc.exe"),
+        ];
+        for c in candidates {
+            if c.exists() && c.is_file() {
+                return Some(c);
+            }
+        }
+    }
+    None
+}
+
+pub fn get_playback_backend_info(
+    prefs: &PlayerPreferences,
+    native_mgr: &NativePlaybackManager,
+) -> PlaybackBackendInfo {
+    let (libmpv_dll, libmpv_version, libvlc_dll, libvlc_version) = native_mgr.detected_info();
+    let libmpv_available = libmpv_dll.is_some();
+    let libvlc_available = libvlc_dll.is_some();
     let mpv = detect_mpv_executable(&prefs.mpv_executable_path);
     let mpv_available = mpv.is_some();
-    let recommended = if mpv_available && prefs.preferred_engine != "embedded" {
-        "mpv"
-    } else {
-        "embedded"
-    };
+    let vlc = detect_vlc_executable();
+    let vlc_available = vlc.is_some();
+
+    let active_default = select_best_engine(
+        &prefs.preferred_engine,
+        libmpv_available,
+        libvlc_available,
+    );
+
+    let engines = vec![
+        PlaybackEngineOption {
+            id: "embedded-libmpv".to_string(),
+            name: "Embedded libmpv (Recommended — Stremio Engine)".to_string(),
+            available: libmpv_available,
+            embedded: true,
+            supports_mkv_hevc: true,
+            supports_native_libass: true,
+            supports_hwdec: true,
+            detail: if let Some(ver) = &libmpv_version {
+                format!("{ver} · D3D11VA hardware decode + software fallback, MKV/HEVC/AV1/AC3/EAC3/DTS, native libass")
+            } else {
+                "Bundled libmpv-2.dll not detected in resources/ or executable directory.".to_string()
+            },
+            license_note: "Bundled Windows build from shinchiro/mpv-winbuild-cmake (GPL-2.0+/3.0+); dynamically loaded so an LGPL libmpv-2.dll build can be substituted without recompiling.".to_string(),
+        },
+        PlaybackEngineOption {
+            id: "embedded-libvlc".to_string(),
+            name: "Embedded libVLC (Optional — System VLC)".to_string(),
+            available: libvlc_available,
+            embedded: true,
+            supports_mkv_hevc: true,
+            supports_native_libass: true,
+            supports_hwdec: true,
+            detail: if let Some(ver) = &libvlc_version {
+                format!("{ver} · Uses existing Windows VLC install (not bundled to avoid ~100 MB plugin bloat)")
+            } else {
+                "System 64-bit VLC (libvlc.dll) not installed. Optional secondary backend.".to_string()
+            },
+            license_note: "LGPL-2.1+ (dynamically loaded from system VLC installation; limited real-time subtitle position/scale control compared to libmpv).".to_string(),
+        },
+        PlaybackEngineOption {
+            id: "webview".to_string(),
+            name: "WebView2 HTML5 (Basic Fallback)".to_string(),
+            available: true,
+            embedded: true,
+            supports_mkv_hevc: false,
+            supports_native_libass: false,
+            supports_hwdec: true,
+            detail: "Browser HTML5 decoder with JS subtitle overlay (MP4/H.264/WebM only; lacks MKV/HEVC/AC3/DTS).".to_string(),
+            license_note: "Uses system Microsoft Edge WebView2 runtime.".to_string(),
+        },
+        PlaybackEngineOption {
+            id: "external-mpv".to_string(),
+            name: "External MPV Window".to_string(),
+            available: mpv_available,
+            embedded: false,
+            supports_mkv_hevc: true,
+            supports_native_libass: true,
+            supports_hwdec: true,
+            detail: if let Some(path) = &mpv {
+                format!("Launches standalone MPV ({})", path.display())
+            } else {
+                "Standalone mpv.exe not detected on PATH.".to_string()
+            },
+            license_note: "External user-installed process.".to_string(),
+        },
+    ];
 
     PlaybackBackendInfo {
+        active_default_engine: active_default.to_string(),
+        libmpv_available,
+        libmpv_path: libmpv_dll.map(|p| p.to_string_lossy().to_string()),
+        libmpv_version,
+        libvlc_available,
+        libvlc_path: libvlc_dll.map(|p| p.to_string_lossy().to_string()),
+        libvlc_version,
         mpv_available,
         mpv_path: mpv.map(|p| p.to_string_lossy().to_string()),
+        vlc_available,
+        vlc_path: vlc.map(|p| p.to_string_lossy().to_string()),
         embedded_available: true,
-        recommended_backend: recommended.to_string(),
+        recommended_backend: active_default.to_string(),
         supports_native_ass_ssa: true,
         android_planned_engine: "Android Media3 / ExoPlayer (+ optional libmpv for styled ASS/SSA anime subtitles)".to_string(),
+        engines,
     }
 }
 

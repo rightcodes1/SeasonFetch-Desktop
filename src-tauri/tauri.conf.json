@@ -19,9 +19,9 @@
         "minWidth": 980,
         "minHeight": 640,
         "decorations": false,
+        "transparent": true,
         "resizable": true,
         "fullscreen": false,
-        "backgroundColor": "#0b0c10",
         "center": true
       }
     ],
@@ -37,6 +37,9 @@
     "active": true,
     "targets": ["nsis"],
     "createUpdaterArtifacts": true,
+    "resources": [
+      "resources/libmpv-2.dll"
+    ],
     "icon": [
       "icons/icon.ico",
       "icons/icon.png"

@@ -248,9 +248,14 @@ pub fn sanitize_settings(mut input: DesktopSettings, allow_localhost: bool) -> D
     input.window_bounds.height = input.window_bounds.height.clamp(640, 2160);
 
     // Sanitize player preferences
-    if !matches!(input.player.preferred_engine.as_str(), "auto" | "mpv" | "embedded") {
-        input.player.preferred_engine = "auto".to_string();
-    }
+    input.player.preferred_engine = match input.player.preferred_engine.as_str() {
+        "auto" | "embedded-libmpv" | "embedded-libvlc" | "webview" | "external-mpv" => {
+            input.player.preferred_engine
+        }
+        "mpv" => "embedded-libmpv".to_string(),
+        "embedded" => "auto".to_string(),
+        _ => "auto".to_string(),
+    };
     input.player.playback_speed = input.player.playback_speed.clamp(0.25, 4.0);
     input.player.default_volume = input.player.default_volume.clamp(0.0, 1.0);
     if !matches!(input.player.aspect_ratio.as_str(), "auto" | "16:9" | "21:9" | "4:3" | "fill") {

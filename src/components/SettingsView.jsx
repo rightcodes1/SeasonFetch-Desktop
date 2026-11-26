@@ -334,12 +334,14 @@ export function SettingsView({
 
           {currentId === 'player' && (
             <div className="sf-panel">
-              <h2>Built-in Media Player &amp; Streaming</h2>
+              <h2>Native Media Player &amp; Engines</h2>
               <div className="sf-setting-row">
                 <div>
                   <strong>Preferred Playback Engine</strong>
                   <p className="sf-muted-sm">
-                    Native MPV: {playerBackend?.mpvAvailable ? `Detected (${playerBackend.mpvPath})` : 'Not detected on PATH (Embedded WebView2 player active)'}
+                    Active default: <strong>{playerBackend?.activeDefaultEngine || 'embedded-libmpv'}</strong>
+                    {playerBackend?.libmpvAvailable ? ` · ${playerBackend.libmpvVersion || 'libmpv-2.dll ready'}` : ' · libmpv-2.dll missing'}
+                    {playerBackend?.libvlcAvailable ? ` · ${playerBackend.libvlcVersion || 'libVLC detected'}` : ''}
                   </p>
                 </div>
                 <select
@@ -347,23 +349,44 @@ export function SettingsView({
                   value={player.preferredEngine || 'auto'}
                   onChange={e => patchPlayer({ preferredEngine: e.target.value })}
                 >
-                  <option value="auto">Auto (MPV if installed, else Built-in)</option>
-                  <option value="embedded">Built-in SeasonFetch Player</option>
-                  <option value="mpv">Native MPV (Windows)</option>
+                  <option value="auto">Auto (Embedded libmpv → libVLC → WebView2)</option>
+                  <option value="embedded-libmpv" disabled={!playerBackend?.libmpvAvailable}>
+                    Embedded libmpv — Primary (MKV/HEVC/AC3/DTS + libass)
+                  </option>
+                  <option value="embedded-libvlc" disabled={!playerBackend?.libvlcAvailable}>
+                    Embedded libVLC — Optional (System VLC {playerBackend?.libvlcAvailable ? 'Installed' : 'Not Found'})
+                  </option>
+                  <option value="webview">WebView2 HTML5 (Basic MP4/WebM Fallback)</option>
+                  <option value="external-mpv" disabled={!playerBackend?.mpvAvailable}>
+                    External MPV Window ({playerBackend?.mpvAvailable ? 'Detected' : 'Not Installed'})
+                  </option>
                 </select>
               </div>
 
+              {Array.isArray(playerBackend?.engines) && playerBackend.engines.length > 0 && (
+                <div className="sf-engine-grid">
+                  {playerBackend.engines.map(eng => (
+                    <div key={eng.id} className={`sf-engine-card ${eng.available ? 'is-ready' : 'is-missing'}`}>
+                      <div className="sf-engine-card-top">
+                        <strong>{eng.name}</strong>
+                        <span className="sf-mini-tag">{eng.available ? 'Ready' : 'Unavailable'}</span>
+                      </div>
+                      <p className="sf-muted-sm">{eng.detail}</p>
+                      <p className="sf-mono-sm">{eng.licenseNote}</p>
+                    </div>
+                  ))}
+                </div>
+              )}
+
               <div className="sf-setting-row">
                 <div>
-                  <strong>Custom MPV Executable Path (Optional)</strong>
-                  <p className="sf-muted-sm">Point to `mpv.exe` for full hardware-decoded MKV + libass ASS/SSA anime playback.</p>
+                  <strong>Hardware Video Decoding (D3D11VA)</strong>
+                  <p className="sf-muted-sm">Uses Windows D3D11VA hardware acceleration inside embedded libmpv with automatic software fallback.</p>
                 </div>
                 <input
-                  className="sf-input"
-                  type="text"
-                  value={player.mpvExecutablePath || ''}
-                  placeholder="C:\Program Files\mpv\mpv.exe"
-                  onChange={e => patchPlayer({ mpvExecutablePath: e.target.value })}
+                  type="checkbox"
+                  checked={Boolean(player.hardwareDecoding ?? true)}
+                  onChange={e => patchPlayer({ hardwareDecoding: e.target.checked })}
                 />
               </div>
 
@@ -383,8 +406,8 @@ export function SettingsView({
 
               <div className="sf-setting-row">
                 <div>
-                  <strong>Preserve ASS/SSA Styled Subtitles (Anime)</strong>
-                  <p className="sf-muted-sm">Render ASS/SSA alignments, colors, italics, bold, and fonts without downgrading to plain text.</p>
+                  <strong>Preserve ASS/SSA Styled Subtitles (Native libass)</strong>
+                  <p className="sf-muted-sm">Renders full anime typesetting, fonts, alignments, karaoke, and multi-line ASS/SSA via libass.</p>
                 </div>
                 <input
                   type="checkbox"
@@ -396,7 +419,7 @@ export function SettingsView({
               <div className="sf-setting-row">
                 <div>
                   <strong>Subtitle Vertical Position ({player.subtitleVerticalPos ?? 92}%)</strong>
-                  <p className="sf-muted-sm">Default vertical height of rendered subtitles.</p>
+                  <p className="sf-muted-sm">Default vertical height of rendered subtitles inside libmpv.</p>
                 </div>
                 <input
                   type="range"
@@ -425,13 +448,15 @@ export function SettingsView({
 
               <div className="sf-setting-row">
                 <div>
-                  <strong>Hardware Video Decoding (MPV)</strong>
-                  <p className="sf-muted-sm">Enables `--hwdec=auto-safe` when launching native MPV.</p>
+                  <strong>Custom External MPV Executable Path (Optional)</strong>
+                  <p className="sf-muted-sm">Only needed if you want to hand off playback to an external mpv.exe window.</p>
                 </div>
                 <input
-                  type="checkbox"
-                  checked={Boolean(player.hardwareDecoding ?? true)}
-                  onChange={e => patchPlayer({ hardwareDecoding: e.target.checked })}
+                  className="sf-input"
+                  type="text"
+                  value={player.mpvExecutablePath || ''}
+                  placeholder="C:\Program Files\mpv\mpv.exe"
+                  onChange={e => patchPlayer({ mpvExecutablePath: e.target.value })}
                 />
               </div>
             </div>

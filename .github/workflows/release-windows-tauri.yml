@@ -110,6 +110,11 @@ jobs:
           cargo check -p seasonfetch-desktop
           npm test
 
+      - name: Fetch Windows libmpv-2.dll runtime for bundling
+        shell: pwsh
+        run: |
+          .\scripts\fetch-libmpv.ps1
+
       - name: Build Tauri 2 Windows NSIS installer and Ed25519 signature
         shell: pwsh
         env:

@@ -1,6 +1,7 @@
 mod api_bridge;
 mod auth_vault;
 mod logger;
+pub mod native_player;
 mod player_engine;
 mod protocol;
 mod settings;
@@ -10,6 +11,7 @@ use api_bridge::{ApiBridge, ApiBridgeRequest, ApiBridgeResponse};
 use auth_vault::AuthVault;
 use chrono::Utc;
 use logger::DesktopLogger;
+use native_player::NativePlaybackManager;
 use player_engine::{
     get_playback_backend_info, get_streaming_engine_status, launch_native_mpv,
     resolve_source_command, LaunchMpvArgs, LaunchMpvResult, ResolveSourceArgs,
@@ -18,7 +20,10 @@ use protocol::{inspect_windows_magnet_handler, open_external_url, ExternalOpenRe
 use seasonfetch_core::models::{
     ActivityEntry, CatalogFeedResponse, DesktopSettings, RecentlyViewedEntry,
 };
-use seasonfetch_core::player::{PlaybackBackendInfo, PlaybackProgressRecord};
+use seasonfetch_core::player::{
+    NativeEngineActionResult, NativeLoadRequest, NativePlayerState, PlaybackBackendInfo,
+    PlaybackProgressRecord,
+};
 use seasonfetch_core::streaming::{ResolvedPlaybackSource, StreamingEngineStatus};
 use serde::Serialize;
 use serde_json::Value;
@@ -37,6 +42,7 @@ struct AppState {
     settings: SettingsManager,
     logger: DesktopLogger,
     updater: UpdaterManager,
+    native_player: NativePlaybackManager,
 }
 
 #[derive(Debug, Serialize)]
@@ -195,7 +201,51 @@ fn get_playback_progress(media_key: String, state: State<'_, AppState>) -> Optio
 #[tauri::command]
 fn get_player_backend_info(state: State<'_, AppState>) -> PlaybackBackendInfo {
     let prefs = state.settings.get().player;
-    get_playback_backend_info(&prefs)
+    get_playback_backend_info(&prefs, &state.native_player)
+}
+
+#[tauri::command]
+fn native_player_load(
+    request: NativeLoadRequest,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> NativeEngineActionResult {
+    let prefs = state.settings.get().player;
+    let res = state.native_player.load(&app, request, prefs);
+    if !res.ok {
+        state.logger.warn(
+            "native_player",
+            res.error.as_deref().unwrap_or("Native embedded playback failed"),
+        );
+    } else {
+        state.logger.info(
+            "native_player",
+            &format!("Started embedded playback using {}", res.engine),
+        );
+    }
+    res
+}
+
+#[tauri::command]
+fn native_player_stop(state: State<'_, AppState>) -> NativeEngineActionResult {
+    state.native_player.stop()
+}
+
+#[tauri::command]
+fn native_player_command(
+    action: String,
+    value: Value,
+    state: State<'_, AppState>,
+) -> Value {
+    match state.native_player.command(&action, value) {
+        Ok(()) => serde_json::json!({ "ok": true }),
+        Err(error) => serde_json::json!({ "ok": false, "error": error }),
+    }
+}
+
+#[tauri::command]
+fn native_player_get_state(state: State<'_, AppState>) -> NativePlayerState {
+    state.native_player.state()
 }
 
 #[tauri::command]
@@ -329,7 +379,7 @@ fn send_desktop_notification(title: String, body: String, app: AppHandle) -> Val
 async fn get_diagnostics(app: AppHandle, state: State<'_, AppState>) -> Result<Value, String> {
     let settings = state.settings.get();
     let magnet = inspect_windows_magnet_handler();
-    let player = get_playback_backend_info(&settings.player);
+    let player = get_playback_backend_info(&settings.player, &state.native_player);
     let streaming = get_streaming_engine_status().await;
     let updater_state = state.updater.get_state();
     let (catalog_entries, meta_entries) = state.api.cache_stats();
@@ -429,19 +479,28 @@ pub fn run() {
                 pubkey_configured,
             );
 
+            let resource_dir = app.path().resource_dir().ok();
+            let native_player = NativePlaybackManager::new(resource_dir);
+            let (mpv_dll, mpv_ver, vlc_dll, vlc_ver) = native_player.detected_info();
+            logger.info(
+                "player",
+                &format!(
+                    "Native engines detected: libmpv={} ({:?}), libvlc={} ({:?})",
+                    mpv_dll.is_some(),
+                    mpv_ver,
+                    vlc_dll.is_some(),
+                    vlc_ver
+                ),
+            );
+
             app.manage(AppState {
                 api: ApiBridge::new(),
                 auth,
                 settings,
                 logger,
                 updater: updater_mgr,
+                native_player,
             });
-
-            // Apply Windows 11 Mica dark backdrop where supported (gracefully ignored on Windows 10)
-            #[cfg(windows)]
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window_vibrancy::apply_mica(&window, Some(true));
-            }
 
             // Build native Windows system tray
             if let (Ok(show_item), Ok(updates_item), Ok(quit_item)) = (
@@ -479,19 +538,26 @@ pub fn run() {
                 }
             }
 
-            // Intercept window close when Minimize-to-Tray is enabled
+            // Sync embedded video surface bounds on resize & intercept close for Minimize-to-Tray
             if let Some(window) = app.get_webview_window("main") {
                 let app_handle = app.handle().clone();
                 let win_clone = window.clone();
-                window.on_window_event(move |event| {
-                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                window.on_window_event(move |event| match event {
+                    tauri::WindowEvent::Resized(_) | tauri::WindowEvent::ScaleFactorChanged { .. } => {
                         if let Some(st) = app_handle.try_state::<AppState>() {
+                            st.native_player.sync_window_bounds();
+                        }
+                    }
+                    tauri::WindowEvent::CloseRequested { api, .. } => {
+                        if let Some(st) = app_handle.try_state::<AppState>() {
+                            let _ = st.native_player.stop();
                             if st.settings.get().minimize_to_tray {
                                 api.prevent_close();
                                 let _ = win_clone.hide();
                             }
                         }
                     }
+                    _ => {}
                 });
             }
 
@@ -517,6 +583,10 @@ pub fn run() {
             list_playback_progress,
             get_playback_progress,
             get_player_backend_info,
+            native_player_load,
+            native_player_stop,
+            native_player_command,
+            native_player_get_state,
             get_streaming_status,
             resolve_playback,
             launch_mpv,

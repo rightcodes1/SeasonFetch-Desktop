@@ -4,6 +4,8 @@ release/
 target/
 src-tauri/target/
 src-tauri/gen/schemas/
+src-tauri/resources/libmpv-2.dll
+src-tauri/resources/*.dll
 .env
 .env.*
 !.env.example

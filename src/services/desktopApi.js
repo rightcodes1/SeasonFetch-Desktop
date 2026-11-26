@@ -283,13 +283,54 @@ export async function clearDesktopHistory() {
 export async function getPlayerBackendInfo() {
   if (isTauriRuntime()) return invoke('get_player_backend_info');
   return {
+    activeDefaultEngine: 'webview',
+    libmpvAvailable: false,
+    libmpvPath: null,
+    libmpvVersion: null,
+    libvlcAvailable: false,
+    libvlcPath: null,
+    libvlcVersion: null,
     mpvAvailable: false,
     mpvPath: null,
+    vlcAvailable: false,
+    vlcPath: null,
     embeddedAvailable: true,
-    recommendedBackend: 'embedded',
+    recommendedBackend: 'webview',
     supportsNativeAssSsa: true,
-    androidPlannedEngine: 'Android Media3 / ExoPlayer'
+    androidPlannedEngine: 'Android Media3 / ExoPlayer (+ optional libmpv for styled ASS/SSA anime subtitles)',
+    engines: []
   };
+}
+
+export async function nativePlayerLoad(request) {
+  if (isTauriRuntime()) return invoke('native_player_load', { request });
+  return { ok: false, engine: 'webview', error: 'Native embedded engine requires the Tauri desktop runtime.' };
+}
+
+export async function nativePlayerStop() {
+  if (isTauriRuntime()) return invoke('native_player_stop');
+  return { ok: true, engine: 'idle' };
+}
+
+export async function nativePlayerCommand(action, value = null) {
+  if (isTauriRuntime()) return invoke('native_player_command', { action, value });
+  return { ok: false, error: 'Native embedded engine requires the Tauri desktop runtime.' };
+}
+
+export async function nativePlayerGetState() {
+  if (isTauriRuntime()) return invoke('native_player_get_state');
+  return null;
+}
+
+export function subscribeNativePlayerState(callback) {
+  if (isTauriRuntime()) {
+    let unlisten = () => {};
+    listen('native-player-state', event => callback(event.payload)).then(fn => {
+      unlisten = fn;
+    });
+    return () => unlisten();
+  }
+  return () => {};
 }
 
 export async function getStreamingStatus() {

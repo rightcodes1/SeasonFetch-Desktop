@@ -1,48 +1,74 @@
-# SeasonFetch Desktop — Tauri 2 + Shared Rust Core Architecture
+# SeasonFetch Desktop — Tauri 2 + Rust + Native Media Engine Architecture
 
-## 1. Workspace Structure
+## 1. High-Level Architecture
+
+SeasonFetch Desktop (`tauri-rebuild`) separates platform-independent application logic from native Windows OS and media-rendering adapters:
 
 ```text
-SeasonFetch-Desktop/ (branch: tauri-rebuild)
-├── Cargo.toml                         # Cargo workspace (seasonfetch-core + src-tauri)
-├── crates/
-│   └── seasonfetch-core/              # Platform-independent Rust domain core (Windows + future Android)
-│       └── src/
-│           ├── models.rs              # Settings, Activity, RecentlyViewed, CatalogItem, PlayerPreferences
-│           ├── validation.rs          # Backend /api/* route allowlist, traversal guards, magnet/HTTPS validator, log redactor
-│           ├── cache.rs               # Bounded TTL stale-while-revalidate cache
-│           ├── streaming.rs           # 4-layer source discovery -> resolution -> streaming -> playback separation
-│           └── player.rs              # PlaybackProgressRecord, MediaTrack, PlaybackBackendInfo
-├── src-tauri/                         # Windows Tauri 2 native shell
-│   ├── tauri.conf.json                # Frameless window, strict CSP, asset protocol, NSIS bundler, Ed25519 updater
-│   ├── capabilities/default.json      # Least-privilege Tauri v2 capability ACLs
-│   └── src/
-│       ├── api_bridge.rs              # reqwest (rustls-tls) IPC bridge to https://season-fetch.vercel.app + SWR Cinemeta catalog cache
-│       ├── auth_vault.rs              # Windows DPAPI (CryptProtectData/CryptUnprotectData) encrypted Supabase session vault
-│       ├── settings.rs                # Atomic settings.json + playback-progress.json persistence
-│       ├── protocol.rs                # Safe OS external handoff + read-only Windows registry magnet diagnostics
-│       ├── logger.rs                  # Rotating 2 MB redacted logger
-│       ├── player_engine.rs           # Native MPV launcher (ASS/SSA + hwdec) + local streaming bridge probe (127.0.0.1:11470)
-│       ├── updater.rs                 # Tauri v2 Ed25519 updater (Stable latest.json / Preview beta.json + recovery state)
-│       └── lib.rs                     # Tauri setup, Windows 11 Mica backdrop, tray icon, IPC command handlers
-├── src/                               # Redesigned Stremio-inspired React frontend + embedded ASS/SSA player
-└── electron/                          # Preserved Electron implementation (untouched until cutover)
++-----------------------------------------------------------------------+
+| React UI (Transparent WebView2 Overlay when Video Plays)              |
+|  Discover · Search · TitleDetail · Library · Activity · Settings      |
+|  PlayerOverlay (HUD, Track Pickers, ASS/SRT Controls, Engine Switcher)|
++----------------------------------▲------------------------------------+
+                                   │ Tauri 2 IPC + Events
++----------------------------------▼------------------------------------+
+| src-tauri (Windows Native Shell)                                      |
+|  ├─ native_player/                                                    |
+|  │   ├─ mod.rs            (Playback Engine Abstraction & Manager)     |
+|  │   ├─ win32_surface.rs  (Click-through WS_CHILD HWND @ HWND_BOTTOM) |
+|  │   ├─ libmpv_backend.rs (Primary: bundled libmpv-2.dll via FFI)     |
+|  │   └─ libvlc_backend.rs (Optional: system libvlc.dll via FFI)       |
+|  ├─ api_bridge.rs         (SeasonFetch API + direct Cinemeta SWR)     |
+|  ├─ auth_vault.rs         (Windows DPAPI encrypted Supabase session)  |
+|  ├─ settings.rs           (Atomic settings + resume + activity)       |
+|  ├─ protocol.rs           (Read-only Windows magnet: registry check)  |
+|  └─ updater.rs            (Tauri 2 Ed25519 signed updater)            |
++----------------------------------▲------------------------------------+
+                                   │
++----------------------------------▼------------------------------------+
+| crates/seasonfetch-core (Platform-Independent Rust — Desktop + Android)|
+|  models · validation · cache · streaming (4-layer) · player contracts |
++-----------------------------------------------------------------------+
 ```
 
-## 2. Four-Layer Media Playback & Streaming Separation
+---
 
-SeasonFetch strictly separates four concerns instead of conflating magnet links with playable video streams:
+## 2. Windows Native Video Embedding & WebView2 Composition
 
-1. **Source Discovery:** Live Cinemeta catalogs (`popular_movies`, `popular_series`, `anime`, `documentaries`, `reality`), SeasonFetch deterministic search, and Torrentio season/movie scans.
-2. **Source Resolution (`seasonfetch_core::streaming::resolve_playback_source`):** Classifies every target honestly into `LocalFile`, `DirectHttp`, `LocalTorrentBridge`, or `RawMagnet`.
-3. **Streaming Engine Abstraction (`src-tauri/src/player_engine.rs`):** Probes whether a local torrent streaming bridge (e.g., Stremio Service on `http://127.0.0.1:11470`) is running to convert `infoHash + fileIdx` into sequential HTTP streams. When no torrent daemon is active, raw magnets are never falsely advertised as playable — the user gets an explicit dialog with one-click **Open Magnet in Download Client**, **Copy Magnet**, or **Play Downloaded Local File**.
-4. **Media Playback Engine:**
-   - **Primary Windows Native Engine:** Native `mpv` launcher with full anime `libass` fidelity (`--sub-ass=yes`, `--sub-ass-override=no`, `--sub-font-provider=auto`, `--sub-pos`, `--sub-delay`, `--hwdec=auto-safe`, `--speed`, `--start`).
-   - **Built-in Embedded Player (`PlayerOverlay.jsx` + `subtitleEngine.js`):** Zero-dependency in-window cinema player with full keyboard shortcuts, playback speed memory, aspect ratio, zoom, PiP, resume position persistence, Next Episode, and a custom **ASS/SSA + SRT + WebVTT styled subtitle renderer** preserving ASS alignments (`\an1..9`), colors, bold, italics, vertical offset, and real-time delay shifting.
+Inspired by **Stremio v5 (`stremio-shell-ng`)**, SeasonFetch avoids the HTML5 WebView2 decoder bottleneck (`MKV / HEVC / AC3 / EAC3 / DTS / ASS`) without spawning an external player window:
 
-## 3. Security Model
+1. **Transparent Tauri 2 Window (`transparent: true`):**
+   - While browsing Discover/Search/Library/Settings, CSS renders opaque dark cinema surfaces (`#0b0c10`).
+   - When native playback starts, `PlayerOverlay` applies `html.sf-native-video-active`, turning WebView2's canvas transparent while keeping SeasonFetch's top bar, transport HUD, and drawers composited cleanly above the video.
+2. **Click-Through Win32 Child Host Surface (`win32_surface.rs`):**
+   - Creates a dedicated `WS_CHILD | WS_CLIPSIBLINGS | WS_DISABLED` HWND inside Tauri's main window positioned strictly at `HWND_BOTTOM` (below WebView2's DirectComposition layer).
+   - `WS_DISABLED` guarantees all mouse clicks, hover reveals, and keyboard shortcuts stay routed to React/WebView2.
+   - Synchronized automatically on `WindowEvent::Resized` and `ScaleFactorChanged`, and hidden (`SW_HIDE`) when playback stops.
+3. **Primary Engine — Embedded `libmpv` (`libmpv_backend.rs`):**
+   - Dynamically loads bundled `resources/libmpv-2.dll` via `libloading` (zero link-time `.lib` coupling).
+   - Configures `wid=<surface_hwnd>`, `vo=gpu-next,gpu,`, `gpu-context=d3d11`, `hwdec=auto-safe` (D3D11VA hardware decode with automatic software fallback, or `hwdec=no` when disabled), and native `libass` (`sub-ass=yes`, `sub-font-provider=auto`).
+   - Dedicated actor/event thread processes `mpv_wait_event` with `mpv_wakeup` for low-latency commands and emits unified `native-player-state` snapshots (`video-codec`, `audio-codec`, `hwdec-current`, `track-list`, `time-pos`, `duration`, `error`).
+   - Fetched reproducibly via `scripts/fetch-libmpv.ps1` (excluded from Git; bundled into the Windows NSIS installer automatically in local & CI builds).
 
-- Renderer runs in WebView2 with strict CSP and narrow Tauri v2 Capability ACLs (`src-tauri/capabilities/default.json`).
-- All backend calls route through Rust `api_bridge.rs` (zero browser `Origin` header, strict `/api/*` allowlist, path-traversal blocking, 1 transient retry on idempotent `GET` only).
-- Supabase tokens are encrypted on disk via Windows DPAPI (`CryptProtectData` / `CryptUnprotectData`), never plaintext.
-- Tauri updates verify **Ed25519 signatures** against the embedded public key using public artifacts in `rightcodes1/SeasonFetch-Desktop-Releases`; no GitHub publishing tokens exist inside the app.
+---
+
+## 3. Optional Secondary Engine — `libVLC` Investigation & Implementation
+
+`libVLC` was evaluated across compatibility, packaging, subtitle fidelity, and licensing before implementing `libvlc_backend.rs`:
+
+| Dimension | Embedded `libmpv` (Primary) | Optional `libVLC` (Secondary) |
+| :--- | :--- | :--- |
+| **Packaging** | Single self-contained `libmpv-2.dll` (bundled into NSIS installer). | Requires `libvlc.dll` + `libvlccore.dll` + ~250 plugin DLLs (~95–110 MB unpacked). **Not bundled**; dynamically detected from existing 64-bit Windows VLC install (`C:\Program Files\VideoLAN\VLC\libvlc.dll`). |
+| **Codecs & Containers** | MKV, MP4, HEVC/H.265, H.264, AV1, AC3, E-AC3, DTS, TrueHD, FLAC, Opus. | Broad FFmpeg-based support (MKV, HEVC, H.264, AC3, AAC, DTS). |
+| **Subtitles (`ASS/SSA`)** | Full `libass` with live `sub-pos`, `sub-scale`, `sub-delay`, and `sub-ass-override` toggle. | Uses `libass` for embedded/external tracks, but lacks live `sub-pos` / `sub-scale` adjustments without filter restarts. |
+| **HDR & GPU Pipeline** | `vo=gpu-next` (`libplacebo` + D3D11VA + HDR tone-mapping). | Standard D3D11/DXVA2 video output. |
+| **Licensing** | `shinchiro/mpv-winbuild-cmake` standard build is **GPL-2.0+/3.0+**. Because `libmpv-2.dll` is loaded dynamically via FFI, an **LGPL** `libmpv-2.dll` build can be substituted without recompiling. | **LGPL-2.1+** (loaded dynamically from user's system VLC install). |
+
+Users can switch engines anytime in **Settings → Player** or inside the live **Player Settings drawer** (`Auto`, `Embedded libmpv`, `Embedded libVLC`, `WebView2 HTML5 Fallback`, or `External MPV`).
+
+---
+
+## 4. Security & Release Pipeline
+- **Auth tokens:** Windows DPAPI (`CryptProtectData` / `CryptUnprotectData`), never plaintext.
+- **API & Protocol boundary:** Strict `/api/*` route allowlist and `magnet:`/`https:`/`ms-settings:defaultapps` validation in `crates/seasonfetch-core`.
+- **CI Release Workflow:** `.github/workflows/release-windows-tauri.yml` fetches `libmpv-2.dll` via `scripts/fetch-libmpv.ps1`, runs `cargo test -p seasonfetch-core`, `cargo check -p seasonfetch-desktop`, and `npm test`, builds the Windows NSIS installer + Ed25519 `.sig`, and publishes to `rightcodes1/SeasonFetch-Desktop-Releases`.

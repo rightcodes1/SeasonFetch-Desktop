@@ -1,24 +1,28 @@
-# SeasonFetch — Future Android Architecture
+# SeasonFetch — Future Native Android Playback & Core Architecture Plan
 
-This document defines how the shared Rust core (`crates/seasonfetch-core`) enables a native Android client without duplicating SeasonFetch business logic or forcing a shrunken desktop UI onto mobile screens.
+SeasonFetch's Rust workspace and playback abstraction are designed so a future native Android app reuses the shared core without dragging desktop rendering assumptions onto mobile.
 
-## 1. Shared Rust Core (`crates/seasonfetch-core`)
+## 1. Shared Layer (`crates/seasonfetch-core`)
+Directly reusable on Android via UniFFI / JNI / Tauri Mobile:
+- **Models & Settings (`models.rs`):** `DesktopSettings`, `PlayerPreferences`, `CatalogItem`, `ActivityEntry`, `RecentlyViewedEntry`.
+- **Validation & Redaction (`validation.rs`):** Route allowlists, magnet/HTTPS guards, sensitive log redaction.
+- **Catalog SWR Cache (`cache.rs`):** Stale-while-revalidate caching for Cinemeta feeds.
+- **4-Layer Streaming Model (`streaming.rs`):** `Discovery → Resolution → StreamingEngine → PlaybackEngine`.
+- **Backend-Independent Player Contracts (`player.rs`):**
+  - `NativePlayerState`, `NativeLoadRequest`, `MediaTrack`, `PlaybackProgressRecord`, `upsert_playback_progress`, `select_best_engine`.
+  - Shared resume thresholds (`>= 92%` completed), speed memory, subtitle delay/position preferences, and next-episode metadata.
 
-`crates/seasonfetch-core` is intentionally **100% platform-independent** (depends only on `serde` and `url`, zero Windows/Win32/Electron dependencies):
+## 2. Android Native Playback Engines (Platform-Specific Rendering)
+Desktop Win32 HWND (`win32_surface.rs`) and `libmpv-2.dll` are **strictly isolated inside `src-tauri/src/native_player/`** and never leaked into `crates/seasonfetch-core`.
 
-- **Shared domain models:** `DesktopSettings`, `CatalogItem`, `ActivityEntry`, `RecentlyViewedEntry`, `PlayerPreferences`.
-- **Shared security & validation:** `/api/*` route allowlist, path-traversal checks, BitTorrent `magnet:` (`btih` / `btmh`) validation, sensitive log redaction, auth key allowlist.
-- **Shared caching:** `StaleWhileRevalidateCache` for Cinemeta catalogs and title metadata.
-- **Shared streaming & playback contracts:** `resolve_playback_source`, `PlaybackProgressRecord`, `MediaTrack`, `StreamingEngineStatus`.
+On Android:
+1. **Primary Engine — Android Media3 / ExoPlayer:**
+   - Renders natively onto `SurfaceView` / `TextureView` inside Compose or Android Views (`PlayerView`).
+   - Hardware decoding via Android `MediaCodec` (HEVC, H.264, AV1, VP9, HDR10/HLG).
+   - Native `MediaSession` integration for lock-screen controls, notification shade, Bluetooth headsets, Picture-in-Picture, and Android TV remote keys.
+2. **Optional Secondary Engine — Android `libmpv` (`mpv-android` / `libmpv.so`):**
+   - Selectable via the exact same `PlayerPreferences.preferredEngine` abstraction when anime releases require full `libass` typesetting, custom embedded fonts, or containers/audio codecs not supported by device `MediaCodec` (e.g., DTS/TrueHD software decode).
 
-Android can consume `seasonfetch-core` either via **Tauri 2 Android** (`#[cfg_attr(mobile, tauri::mobile_entry_point)]` already wired in `src-tauri/src/lib.rs`) OR via **UniFFI** bindings directly from Kotlin/Jetpack Compose.
-
-## 2. Mobile-Native Android Responsibilities (Separate from Desktop)
-
-- **UI:** Dedicated mobile-native navigation (bottom navigation bar for Discover / Search / Library / Settings, gesture-friendly sheets, adaptive phone/tablet/Android TV layouts) — **never** a shrunk desktop sidebar.
-- **Media Playback:**
-  - **Primary:** **Android Media3 / ExoPlayer** (native SurfaceView/PlayerView, hardware MediaCodec decoding, Picture-in-Picture, MediaSession lock-screen/notification controls).
-  - **Anime ASS/SSA Option:** Integrate `libass-android` or optional `mpv-android` playback backend when styled ASS/SSA anime subtitle fidelity exceeds ExoPlayer's WebVTT/SSA subtitle renderer.
-- **Secure Storage:** Android Keystore + EncryptedSharedPreferences (`androidx.security:security-crypto`) implementing the exact same `authStorage` contract as Windows DPAPI.
-- **External Magnet / Download Handling:** Standard Android `Intent(Intent.ACTION_VIEW, Uri.parse(magnetUri))` with `ActivityNotFoundException` handling (never hardcoding a specific Android torrent client).
-- **Backend:** Connects to the exact same `https://season-fetch.vercel.app` API and Supabase Auth + RLS database.
+## 3. UI & Controls Separation
+- On Windows, React `PlayerOverlay` sits in a transparent WebView2 layer above the Win32 `libmpv`/`libVLC` surface and emits engine-agnostic commands (`toggle_pause`, `seek_absolute`, `set_audio_track`, `set_subtitle_track`, `set_subtitle_delay_ms`, `set_speed`, `set_aspect_ratio`).
+- On Android, native Jetpack Compose player controls bind directly to the same `NativePlayerState` / `PlaybackProgressRecord` schema backed by Media3 / optional `libmpv.so`, keeping preferences and watch-history sync consistent across platforms.

@@ -319,6 +319,25 @@ export default function App() {
     const unsubNav = subscribeDesktopNavigation(payload => {
       if (payload?.tab) selectTab(payload.tab, { settingsSection: payload.section || 'general' });
       if (payload?.focusSearch) setTimeout(() => searchInputRef.current?.focus(), 30);
+      if (payload?.diagPlay?.target) {
+        const dp = payload.diagPlay;
+        setSettings(prev => {
+          if (!prev) return prev;
+          const nextPlayer = { ...(prev.player || {}) };
+          if (dp.engine) nextPlayer.preferredEngine = dp.engine;
+          if (typeof dp.hwdec === 'boolean') nextPlayer.hardwareDecoding = dp.hwdec;
+          return { ...prev, player: nextPlayer };
+        });
+        setPlayerSession({
+          mediaKey: `diag:${dp.target}`,
+          title: dp.target.split(/[\\/]/).pop() || 'Diagnostic Playback',
+          subtitle: `Diagnostic (${dp.engine || 'embedded-libmpv'})`,
+          streamUrl: dp.target,
+          rawPath: dp.target,
+          resumeSecs: 0,
+          subtitleFile: dp.subtitleFile || null
+        });
+      }
     });
 
     const handleOnline = () => {

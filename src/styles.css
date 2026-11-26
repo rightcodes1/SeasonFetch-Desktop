@@ -1720,9 +1720,11 @@ html.sf-native-video-active .sf-app {
 }
 
 html.sf-native-video-active .sf-titlebar,
+html.sf-native-video-active .sf-body,
 html.sf-native-video-active .sf-workspace {
-  visibility: hidden;
-  pointer-events: none;
+  display: none !important;
+  visibility: hidden !important;
+  pointer-events: none !important;
 }
 
 .sf-player-overlay {

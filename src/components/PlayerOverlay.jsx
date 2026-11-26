@@ -128,7 +128,7 @@ export function PlayerOverlay({
   // WebView2 HTML5 fallback subtitle state (ASS/SSA + SRT + VTT)
   const [subCues, setSubCues] = useState([]);
   const [subTrackName, setSubTrackName] = useState('Auto');
-  const [subFilePath, setSubFilePath] = useState(null);
+  const [subFilePath, setSubFilePath] = useState(session?.subtitleFile || null);
   const [subEnabled, setSubEnabled] = useState(true);
   const [subDelayMs, setSubDelayMs] = useState(playerPrefs?.subtitleDelayMs ?? 0);
   const [subVerticalPos, setSubVerticalPos] = useState(playerPrefs?.subtitleVerticalPos ?? 92);

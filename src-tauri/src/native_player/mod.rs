@@ -90,6 +90,16 @@ impl NativePlaybackManager {
         }
     }
 
+    pub fn recent_logs(&self) -> Vec<String> {
+        let Ok(inner) = self.inner.lock() else {
+            return Vec::new();
+        };
+        match &inner.backend {
+            ActiveBackend::LibMpv(m) => m.recent_logs(),
+            ActiveBackend::LibVlc(_) | ActiveBackend::None => Vec::new(),
+        }
+    }
+
     pub fn load(
         &self,
         app: &AppHandle,
@@ -132,8 +142,8 @@ impl NativePlaybackManager {
         }
 
         // Match Stremio v5 (stremio-shell-ng) and tauri-plugin-libmpv:
-        // Attach libmpv directly to the top-level Tauri window HWND so its D3D11 swapchain
-        // composites cleanly behind transparent WebView2 without sibling WS_CLIPSIBLINGS clipping.
+        // Attach native renderers directly to the top-level Tauri window HWND so their D3D11
+        // surfaces composite behind transparent WebView2 without sibling WS_CLIPSIBLINGS clipping.
         #[cfg(windows)]
         let wid_hwnd = {
             let Some(win) = app.get_webview_window("main") else {
@@ -155,24 +165,10 @@ impl NativePlaybackManager {
                     };
                 }
             };
-            if chosen == "embedded-libvlc" {
-                if inner.surface.is_none() {
-                    if let Ok(s) = Win32VideoSurface::create(parent_hwnd) {
-                        inner.surface = Some(s);
-                    }
-                }
-                if let Some(surface) = inner.surface.as_ref() {
-                    surface.show_and_fit();
-                    surface.raw_hwnd()
-                } else {
-                    parent_hwnd
-                }
-            } else {
-                if let Some(surface) = inner.surface.as_ref() {
-                    surface.hide();
-                }
-                parent_hwnd
+            if let Some(surface) = inner.surface.as_ref() {
+                surface.hide();
             }
+            parent_hwnd
         };
 
         #[cfg(not(windows))]

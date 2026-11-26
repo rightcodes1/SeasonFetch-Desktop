@@ -502,6 +502,75 @@ pub fn run() {
                 native_player,
             });
 
+            // Optional diagnostic CLI trigger: `--diag-play <path> [--diag-engine <id>] [--diag-hwdec <0|1>] [--diag-sub <path>]`
+            // Opens the real PlayerOverlay inside the live Tauri window and writes full MPV/state telemetry to desktop.log.
+            let cli_args: Vec<String> = std::env::args().collect();
+            if let Some(pos) = cli_args.iter().position(|a| a == "--diag-play") {
+                if let Some(target_path) = cli_args.get(pos + 1).cloned() {
+                    let diag_engine = cli_args
+                        .iter()
+                        .position(|a| a == "--diag-engine")
+                        .and_then(|i| cli_args.get(i + 1))
+                        .cloned();
+                    let diag_hwdec = cli_args
+                        .iter()
+                        .position(|a| a == "--diag-hwdec")
+                        .and_then(|i| cli_args.get(i + 1))
+                        .map(|v| v != "0" && v != "false");
+                    let diag_sub = cli_args
+                        .iter()
+                        .position(|a| a == "--diag-sub")
+                        .and_then(|i| cli_args.get(i + 1))
+                        .cloned();
+                    let app_handle = app.handle().clone();
+                    tauri::async_runtime::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        if let Some(win) = app_handle.get_webview_window("main") {
+                            let _ = win.emit(
+                                "desktop-navigate",
+                                serde_json::json!({
+                                    "diagPlay": {
+                                        "target": target_path,
+                                        "engine": diag_engine,
+                                        "hwdec": diag_hwdec,
+                                        "subtitleFile": diag_sub
+                                    }
+                                }),
+                            );
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+                        if let Some(st) = app_handle.try_state::<AppState>() {
+                            let snap = st.native_player.state();
+                            st.logger.info(
+                                "diag_player",
+                                &format!(
+                                    "STATE engine={} active={} playing={} vo_configured={} current_vo={:?} codec={:?}/{:?} res={}x{} hwdec={:?} fps={:.2} pos={:.2}/{:.2} audio_tracks={} sub_tracks={} err={:?}",
+                                    snap.engine,
+                                    snap.active,
+                                    snap.playing,
+                                    snap.vo_configured,
+                                    snap.current_vo,
+                                    snap.video_codec,
+                                    snap.audio_codec,
+                                    snap.video_width,
+                                    snap.video_height,
+                                    snap.hwdec_current,
+                                    snap.estimated_fps,
+                                    snap.position_secs,
+                                    snap.duration_secs,
+                                    snap.audio_tracks.len(),
+                                    snap.subtitle_tracks.len(),
+                                    snap.error
+                                ),
+                            );
+                            for line in st.native_player.recent_logs() {
+                                st.logger.info("mpv_log", &line);
+                            }
+                        }
+                    });
+                }
+            }
+
             // Optional CLI flag `--auto-update-now` triggers the exact production signed updater pipeline
             // (check -> download -> Ed25519 verify -> install -> restart) for end-to-end verification.
             let auto_update_cli = std::env::args().any(|a| a == "--auto-update-now");

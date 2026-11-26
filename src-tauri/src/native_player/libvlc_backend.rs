@@ -212,6 +212,8 @@ impl EmbeddedLibVlc {
                     CString::new("--no-video-title-show").unwrap(),
                     CString::new("--quiet").unwrap(),
                     CString::new("--avcodec-hw=any").unwrap(),
+                    CString::new("--no-mouse-events").unwrap(),
+                    CString::new("--no-keyboard-events").unwrap(),
                 ];
                 let ptrs: Vec<*const c_char> = args.iter().map(|c| c.as_ptr()).collect();
                 let inst = unsafe { (syms.libvlc_new)(ptrs.len() as c_int, ptrs.as_ptr()) };

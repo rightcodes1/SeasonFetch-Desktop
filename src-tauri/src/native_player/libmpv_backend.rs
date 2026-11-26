@@ -19,6 +19,7 @@ const MPV_FORMAT_DOUBLE: c_int = 5;
 
 const MPV_EVENT_NONE: c_int = 0;
 const MPV_EVENT_SHUTDOWN: c_int = 1;
+const MPV_EVENT_LOG_MESSAGE: c_int = 2;
 const MPV_EVENT_START_FILE: c_int = 6;
 const MPV_EVENT_END_FILE: c_int = 7;
 const MPV_EVENT_FILE_LOADED: c_int = 8;
@@ -26,6 +27,14 @@ const MPV_EVENT_PROPERTY_CHANGE: c_int = 22;
 
 const MPV_END_FILE_REASON_EOF: c_int = 0;
 const MPV_END_FILE_REASON_ERROR: c_int = 4;
+
+#[repr(C)]
+struct MpvEventLogMessage {
+    prefix: *const c_char,
+    level: *const c_char,
+    text: *const c_char,
+    log_level: c_int,
+}
 
 #[repr(C)]
 struct MpvEvent {
@@ -66,6 +75,7 @@ struct LibMpvSymbols {
     mpv_get_property: unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *mut c_void) -> c_int,
     mpv_command: unsafe extern "C" fn(*mut c_void, *const *const c_char) -> c_int,
     mpv_observe_property: unsafe extern "C" fn(*mut c_void, u64, *const c_char, c_int) -> c_int,
+    mpv_request_log_messages: unsafe extern "C" fn(*mut c_void, *const c_char) -> c_int,
     mpv_wait_event: unsafe extern "C" fn(*mut c_void, c_double) -> *const MpvEvent,
     mpv_wakeup: unsafe extern "C" fn(*mut c_void),
     mpv_free: unsafe extern "C" fn(*mut c_void),
@@ -127,6 +137,10 @@ impl LibMpvSymbols {
                 b"mpv_observe_property\0",
                 unsafe extern "C" fn(*mut c_void, u64, *const c_char, c_int) -> c_int
             );
+            let mpv_request_log_messages = sym!(
+                b"mpv_request_log_messages\0",
+                unsafe extern "C" fn(*mut c_void, *const c_char) -> c_int
+            );
             let mpv_wait_event = sym!(
                 b"mpv_wait_event\0",
                 unsafe extern "C" fn(*mut c_void, c_double) -> *const MpvEvent
@@ -152,6 +166,7 @@ impl LibMpvSymbols {
                 mpv_get_property,
                 mpv_command,
                 mpv_observe_property,
+                mpv_request_log_messages,
                 mpv_wait_event,
                 mpv_wakeup,
                 mpv_free,
@@ -395,6 +410,7 @@ pub struct EmbeddedLibMpv {
     tx: Sender<MpvCmd>,
     wakeup: Arc<Mutex<Option<WakeupHandle>>>,
     state: Arc<Mutex<NativePlayerState>>,
+    logs: Arc<Mutex<Vec<String>>>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -411,9 +427,11 @@ impl EmbeddedLibMpv {
             engine: "embedded-libmpv".to_string(),
             ..NativePlayerState::default()
         }));
+        let logs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let wakeup: Arc<Mutex<Option<WakeupHandle>>> = Arc::new(Mutex::new(None));
 
         let state_thread = Arc::clone(&state);
+        let logs_thread = Arc::clone(&logs);
         let wakeup_thread = Arc::clone(&wakeup);
 
         let join = thread::Builder::new()
@@ -472,6 +490,11 @@ impl EmbeddedLibMpv {
                     return;
                 }
 
+                // Request info-level libmpv logs for VO/D3D11/hwdec/codec diagnostics
+                if let Ok(lvl) = CString::new("v") {
+                    unsafe { (syms.mpv_request_log_messages)(ctx, lvl.as_ptr()) };
+                }
+
                 if let Ok(mut w) = wakeup_thread.lock() {
                     *w = Some(WakeupHandle {
                         ctx: ctx as usize,
@@ -498,6 +521,8 @@ impl EmbeddedLibMpv {
                 syms.observe(ctx, 16, "aid", MPV_FORMAT_INT64);
                 syms.observe(ctx, 17, "sid", MPV_FORMAT_INT64);
                 syms.observe(ctx, 18, "sub-delay", MPV_FORMAT_DOUBLE);
+                syms.observe(ctx, 19, "current-vo", MPV_FORMAT_STRING);
+                syms.observe(ctx, 20, "estimated-vf-fps", MPV_FORMAT_DOUBLE);
 
                 let _ = ready_tx.send(Ok(()));
 
@@ -752,6 +777,39 @@ impl EmbeddedLibMpv {
                         MPV_EVENT_SHUTDOWN => {
                             running = false;
                         }
+                        MPV_EVENT_LOG_MESSAGE => {
+                            if !ev.data.is_null() {
+                                let msg = unsafe { &*(ev.data as *const MpvEventLogMessage) };
+                                let pfx = if msg.prefix.is_null() {
+                                    String::new()
+                                } else {
+                                    unsafe { CStr::from_ptr(msg.prefix).to_string_lossy().to_string() }
+                                };
+                                let lvl = if msg.level.is_null() {
+                                    String::new()
+                                } else {
+                                    unsafe { CStr::from_ptr(msg.level).to_string_lossy().to_string() }
+                                };
+                                let txt = if msg.text.is_null() {
+                                    String::new()
+                                } else {
+                                    unsafe { CStr::from_ptr(msg.text).to_string_lossy().trim().to_string() }
+                                };
+                                if matches!(
+                                    pfx.as_str(),
+                                    "vo" | "vo/gpu-next" | "vo/gpu" | "vo/gpu-next/d3d11" | "vo/gpu/d3d11" | "vd" | "ad" | "cplayer" | "d3d11" | "sub" | "lavf"
+                                ) || lvl == "error" || lvl == "warn"
+                                {
+                                    if let Ok(mut buf) = logs_thread.lock() {
+                                        buf.push(format!("[{lvl}] [{pfx}] {txt}"));
+                                        if buf.len() > 160 {
+                                            let excess = buf.len() - 160;
+                                            buf.drain(0..excess);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         MPV_EVENT_START_FILE => {
                             if let Ok(mut st) = state_thread.lock() {
                                 st.active = true;
@@ -896,6 +954,19 @@ impl EmbeddedLibMpv {
                                         st.vo_configured = unsafe { *(prop.data as *const c_int) } != 0;
                                         emit_now = true;
                                     }
+                                    ("current-vo", MPV_FORMAT_STRING) if !prop.data.is_null() => {
+                                        let sptr = unsafe { *(prop.data as *const *const c_char) };
+                                        if !sptr.is_null() {
+                                            st.current_vo = Some(unsafe { CStr::from_ptr(sptr).to_string_lossy().to_string() });
+                                            emit_now = true;
+                                        }
+                                    }
+                                    ("estimated-vf-fps", MPV_FORMAT_DOUBLE) if !prop.data.is_null() => {
+                                        let fps = unsafe { *(prop.data as *const c_double) };
+                                        if fps.is_finite() && fps >= 0.0 {
+                                            st.estimated_fps = fps;
+                                        }
+                                    }
                                     ("track-list/count" | "aid" | "sid", _) => {
                                         refresh_tracks = true;
                                     }
@@ -941,11 +1012,16 @@ impl EmbeddedLibMpv {
                 tx,
                 wakeup,
                 state,
+                logs,
                 join: Some(join),
             }),
             Ok(Err(e)) => Err(e),
             Err(_) => Err("Timed out waiting for libmpv initialization".to_string()),
         }
+    }
+
+    pub fn recent_logs(&self) -> Vec<String> {
+        self.logs.lock().map(|l| l.clone()).unwrap_or_default()
     }
 
     pub fn send(&self, cmd: MpvCmd) -> Result<(), String> {
@@ -1091,6 +1167,8 @@ fn sync_full_snapshot(
     let vw = syms.get_prop_i64(ctx, "video-params/w").unwrap_or(0).max(0) as u32;
     let vh = syms.get_prop_i64(ctx, "video-params/h").unwrap_or(0).max(0) as u32;
     let vo_configured = syms.get_prop_flag(ctx, "vo-configured").unwrap_or(false);
+    let current_vo = syms.get_prop_str(ctx, "current-vo");
+    let estimated_fps = syms.get_prop_f64(ctx, "estimated-vf-fps").unwrap_or(0.0);
     let track_json = syms.get_prop_str(ctx, "track-list").unwrap_or_default();
     let (audio_tracks, subtitle_tracks, selected_audio_id, selected_subtitle_id) =
         parse_track_list(&track_json);
@@ -1114,6 +1192,10 @@ fn sync_full_snapshot(
         st.video_width = vw;
         st.video_height = vh;
         st.vo_configured = vo_configured;
+        st.current_vo = current_vo;
+        if estimated_fps.is_finite() && estimated_fps >= 0.0 {
+            st.estimated_fps = estimated_fps;
+        }
         st.audio_tracks = audio_tracks;
         st.subtitle_tracks = subtitle_tracks;
         st.selected_audio_id = selected_audio_id;

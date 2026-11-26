@@ -107,6 +107,10 @@ pub struct NativePlayerState {
     pub video_height: u32,
     pub vo_configured: bool,
     #[serde(default)]
+    pub current_vo: Option<String>,
+    #[serde(default)]
+    pub estimated_fps: f64,
+    #[serde(default)]
     pub audio_tracks: Vec<MediaTrack>,
     #[serde(default)]
     pub subtitle_tracks: Vec<MediaTrack>,
@@ -145,6 +149,8 @@ impl Default for NativePlayerState {
             video_width: 0,
             video_height: 0,
             vo_configured: false,
+            current_vo: None,
+            estimated_fps: 0.0,
             audio_tracks: Vec::new(),
             subtitle_tracks: Vec::new(),
             selected_audio_id: None,

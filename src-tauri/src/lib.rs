@@ -5,6 +5,8 @@ pub mod native_player;
 mod player_engine;
 mod protocol;
 mod settings;
+mod subtitles;
+mod torrentio_client;
 mod updater;
 
 use api_bridge::{ApiBridge, ApiBridgeRequest, ApiBridgeResponse};
@@ -25,21 +27,31 @@ use seasonfetch_core::player::{
     PlaybackProgressRecord,
 };
 use seasonfetch_core::streaming::{ResolvedPlaybackSource, StreamSessionStatus, StreamingEngineStatus};
+use seasonfetch_core::subtitles::{
+    SubtitleDownloadRequest, SubtitleDownloadResult, SubtitleSearchQuery, SubtitleSearchResponse,
+};
+use seasonfetch_core::torrentio::{
+    MovieTorrentioResponse, SeasonTorrentioResponse, TorrentioFilters,
+};
 use seasonfetch_streaming::{StartTorrentRequest, StatusCallback, TorrentStreamingEngine};
 use serde::Serialize;
 use serde_json::Value;
 use settings::SettingsManager;
 use std::fs;
 use std::sync::Arc;
+use subtitles::SubtitleManager;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_notification::NotificationExt;
+use torrentio_client::{AddonManifestCheck, TorrentioClient};
 use updater::{UpdaterManager, UpdaterState};
 
 struct AppState {
     api: ApiBridge,
+    torrentio: Arc<TorrentioClient>,
+    subtitles: SubtitleManager,
     auth: AuthVault,
     settings: SettingsManager,
     logger: DesktopLogger,
@@ -105,9 +117,133 @@ async fn fetch_discover_catalog(
 }
 
 #[tauri::command]
+async fn cinemeta_search(
+    query: String,
+    media_type: String,
+    mode: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<ApiBridgeResponse, String> {
+    Ok(state
+        .api
+        .search_cinemeta(&query, &media_type, mode.as_deref().unwrap_or("full"))
+        .await)
+}
+
+#[tauri::command]
+async fn cinemeta_detail(
+    id: String,
+    media_type: String,
+    state: State<'_, AppState>,
+) -> Result<ApiBridgeResponse, String> {
+    Ok(state.api.fetch_cinemeta_detail(&id, &media_type).await)
+}
+
+#[tauri::command]
+async fn torrentio_check_manifest(
+    base_url: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<AddonManifestCheck, String> {
+    let url = base_url.unwrap_or_else(|| state.settings.get().torrentio_base_url);
+    Ok(state.torrentio.check_manifest(&url).await)
+}
+
+#[tauri::command]
+async fn torrentio_movie_sources(
+    movie_id: String,
+    preference: String,
+    audio_mode: String,
+    filters: Option<TorrentioFilters>,
+    state: State<'_, AppState>,
+) -> Result<MovieTorrentioResponse, String> {
+    let base_url = state.settings.get().torrentio_base_url;
+    let res = state
+        .torrentio
+        .get_movie_sources(
+            &base_url,
+            &movie_id,
+            &preference,
+            &audio_mode,
+            &filters.unwrap_or_default(),
+        )
+        .await;
+    if let Err(ref e) = res {
+        state
+            .logger
+            .warn("torrentio", &format!("Movie lookup {movie_id} failed: {e}"));
+    }
+    res
+}
+
+#[tauri::command]
+async fn torrentio_season_sources(
+    series_id: String,
+    season: u32,
+    episodes: Vec<u32>,
+    preference: String,
+    audio_mode: String,
+    filters: Option<TorrentioFilters>,
+    state: State<'_, AppState>,
+) -> Result<SeasonTorrentioResponse, String> {
+    let base_url = state.settings.get().torrentio_base_url;
+    let res = state
+        .torrentio
+        .get_season_sources(
+            &base_url,
+            &series_id,
+            season,
+            &episodes,
+            &preference,
+            &audio_mode,
+            &filters.unwrap_or_default(),
+        )
+        .await;
+    if let Err(ref e) = res {
+        state.logger.warn(
+            "torrentio",
+            &format!("Season lookup {series_id} S{season} failed: {e}"),
+        );
+    }
+    res
+}
+
+#[tauri::command]
+async fn subtitles_search(
+    query: SubtitleSearchQuery,
+    state: State<'_, AppState>,
+) -> Result<SubtitleSearchResponse, String> {
+    let prefs = state.settings.get().subtitle_providers;
+    let res = state.subtitles.search(&query, &prefs).await;
+    if !res.warnings.is_empty() {
+        state.logger.warn(
+            "subtitles",
+            &format!("Subtitle search warnings: {}", res.warnings.join(" | ")),
+        );
+    }
+    Ok(res)
+}
+
+#[tauri::command]
+async fn subtitles_download(
+    request: SubtitleDownloadRequest,
+    state: State<'_, AppState>,
+) -> Result<SubtitleDownloadResult, String> {
+    let prefs = state.settings.get().subtitle_providers;
+    let res = state.subtitles.download_subtitle(&request, &prefs).await;
+    if let Some(ref err) = res.error {
+        state
+            .logger
+            .warn("subtitles", &format!("Subtitle download failed: {err}"));
+    }
+    Ok(res)
+}
+
+#[tauri::command]
 fn clear_local_cache(state: State<'_, AppState>) -> Value {
     state.api.clear_caches();
-    state.logger.info("cache", "Cleared local Cinemeta catalog and metadata caches");
+    state.torrentio.clear_cache();
+    state
+        .logger
+        .info("cache", "Cleared local Cinemeta and Torrentio caches");
     serde_json::json!({ "ok": true })
 }
 
@@ -581,6 +717,7 @@ pub fn run() {
                 app_data_dir.join("settings.json"),
                 app_data_dir.join("playback-progress.json"),
                 cfg!(debug_assertions),
+                &version,
             );
             let initial_settings = settings.get();
             let auth = AuthVault::new(app_data_dir.join("auth-vault.json"));
@@ -651,6 +788,8 @@ pub fn run() {
 
             app.manage(AppState {
                 api: ApiBridge::new(),
+                torrentio: Arc::new(TorrentioClient::new()),
+                subtitles: SubtitleManager::new(app_data_dir.join("subtitles")),
                 auth,
                 settings,
                 logger,
@@ -960,6 +1099,13 @@ pub fn run() {
             get_app_info,
             api_request,
             fetch_discover_catalog,
+            cinemeta_search,
+            cinemeta_detail,
+            torrentio_check_manifest,
+            torrentio_movie_sources,
+            torrentio_season_sources,
+            subtitles_search,
+            subtitles_download,
             clear_local_cache,
             open_external,
             inspect_magnet_handler,

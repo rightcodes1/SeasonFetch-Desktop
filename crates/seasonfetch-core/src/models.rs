@@ -1,10 +1,54 @@
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_BACKEND_URL: &str = "https://season-fetch.vercel.app";
+pub const DEFAULT_TORRENTIO_BASE_URL: &str = "https://torrentio.strem.fun";
+pub const DEFAULT_OPENSUBTITLES_ADDON_URL: &str = "https://opensubtitles-v3.strem.io";
 pub const RELEASES_REPO_SLUG: &str = "rightcodes1/SeasonFetch-Desktop-Releases";
 pub const MAX_RECENT_SEARCHES: usize = 16;
 pub const MAX_ACTIVITY_ENTRIES: usize = 80;
 pub const MAX_RECENTLY_VIEWED: usize = 24;
+
+pub fn default_update_channel_for_version(version: &str) -> String {
+    if version.to_ascii_lowercase().contains("-beta")
+        || version.to_ascii_lowercase().contains("-alpha")
+        || version.to_ascii_lowercase().contains("-rc")
+    {
+        "preview".to_string()
+    } else {
+        "stable".to_string()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SubtitleProviderSettings {
+    pub preferred_language: String,     // ISO-639-2/1 e.g. "eng", "ara", "spa"
+    pub auto_select: bool,              // auto-pick best matching external sub when none selected
+    pub save_alongside_local: bool,     // save downloaded subs next to local video files
+    pub opensubtitles_enabled: bool,    // direct OpenSubtitles addon + optional REST key
+    #[serde(default)]
+    pub opensubtitles_api_key: String,
+    pub subdl_enabled: bool,            // direct SubDL API (optional user API key)
+    #[serde(default)]
+    pub subdl_api_key: String,
+    #[serde(default)]
+    pub custom_addon_url: String,       // optional Stremio-compatible subtitle addon URL
+}
+
+impl Default for SubtitleProviderSettings {
+    fn default() -> Self {
+        Self {
+            preferred_language: "eng".to_string(),
+            auto_select: true,
+            save_alongside_local: false,
+            opensubtitles_enabled: true,
+            opensubtitles_api_key: String::new(),
+            subdl_enabled: true,
+            subdl_api_key: String::new(),
+            custom_addon_url: String::new(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -132,7 +176,13 @@ pub struct DesktopSettings {
     pub compact_nav: bool,
     pub show_spotlight: bool,
     pub default_search_mode: String,  // "series" | "movie"
-    pub backend_url: String,
+    pub backend_url: String,          // Account sync backend ONLY
+    #[serde(default = "default_torrentio_url")]
+    pub torrentio_base_url: String,   // Direct native Torrentio addon base URL
+    #[serde(default)]
+    pub downloads_dir: String,        // Optional explicit Downloads directory
+    #[serde(default)]
+    pub subtitle_providers: SubtitleProviderSettings,
     pub ranking_preference: String,
     pub audio_preference: String,
     pub resolution_preference: String,
@@ -149,6 +199,10 @@ pub struct DesktopSettings {
     pub window_bounds: WindowBounds,
 }
 
+fn default_torrentio_url() -> String {
+    DEFAULT_TORRENTIO_BASE_URL.to_string()
+}
+
 impl Default for DesktopSettings {
     fn default() -> Self {
         Self {
@@ -161,10 +215,13 @@ impl Default for DesktopSettings {
             show_spotlight: true,
             default_search_mode: "series".to_string(),
             backend_url: DEFAULT_BACKEND_URL.to_string(),
+            torrentio_base_url: DEFAULT_TORRENTIO_BASE_URL.to_string(),
+            downloads_dir: String::new(),
+            subtitle_providers: SubtitleProviderSettings::default(),
             ranking_preference: "smallest-acceptable".to_string(),
             audio_preference: "any".to_string(),
             resolution_preference: "1080p".to_string(),
-            cache_max_mb: 256,
+            cache_max_mb: 512,
             recent_searches: Vec::new(),
             recently_viewed: Vec::new(),
             activity_log: Vec::new(),
@@ -219,6 +276,19 @@ pub fn sanitize_settings(mut input: DesktopSettings, allow_localhost: bool) -> D
         input.default_search_mode = "series".to_string();
     }
     input.backend_url = crate::validation::validate_backend_url(&input.backend_url, allow_localhost);
+    input.torrentio_base_url = crate::validation::validate_addon_base_url(&input.torrentio_base_url)
+        .unwrap_or_else(|| DEFAULT_TORRENTIO_BASE_URL.to_string());
+    input.downloads_dir = input.downloads_dir.trim().to_string();
+    let sub_lang = input.subtitle_providers.preferred_language.trim().to_ascii_lowercase();
+    input.subtitle_providers.preferred_language = if sub_lang.len() >= 2 && sub_lang.len() <= 5 && sub_lang.bytes().all(|b| b.is_ascii_alphabetic()) {
+        sub_lang
+    } else {
+        "eng".to_string()
+    };
+    input.subtitle_providers.opensubtitles_api_key = input.subtitle_providers.opensubtitles_api_key.trim().to_string();
+    input.subtitle_providers.subdl_api_key = input.subtitle_providers.subdl_api_key.trim().to_string();
+    input.subtitle_providers.custom_addon_url = crate::validation::validate_addon_base_url(&input.subtitle_providers.custom_addon_url)
+        .unwrap_or_default();
 
     if !matches!(
         input.ranking_preference.as_str(),

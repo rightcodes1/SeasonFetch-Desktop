@@ -20,10 +20,12 @@ use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub const SPARSE_CHUNK_SIZE: u64 = 2 * 1024 * 1024; // 2 MiB per chunk file
 const MAX_OPEN_HANDLES: usize = 64;
+const MIN_CACHE_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct ChunkKey {
@@ -36,21 +38,86 @@ struct HandlePool {
     closed: bool,
     handles: HashMap<ChunkKey, File>,
     lru: VecDeque<ChunkKey>,
+    /// Tracks on-disk chunks in recency order for active cache-budget enforcement.
+    disk_chunks: HashMap<ChunkKey, u64>,
+    disk_lru: VecDeque<ChunkKey>,
+    total_disk_bytes: u64,
+    max_cache_bytes: Arc<AtomicU64>,
 }
 
 impl HandlePool {
-    fn new(root: PathBuf) -> Self {
+    fn new(root: PathBuf, max_cache_bytes: Arc<AtomicU64>) -> Self {
         Self {
             root,
             closed: false,
             handles: HashMap::new(),
             lru: VecDeque::new(),
+            disk_chunks: HashMap::new(),
+            disk_lru: VecDeque::new(),
+            total_disk_bytes: 0,
+            max_cache_bytes,
         }
     }
 
     fn chunk_path(&self, key: ChunkKey) -> PathBuf {
         self.root
             .join(format!("f{}_c{:06}.blk", key.file_id, key.chunk_idx))
+    }
+
+    fn touch_disk_lru(&mut self, key: ChunkKey, approx_size: u64) {
+        if let Some(pos) = self.disk_lru.iter().position(|k| *k == key) {
+            self.disk_lru.remove(pos);
+        }
+        self.disk_lru.push_back(key);
+        let entry = self.disk_chunks.entry(key).or_insert(0);
+        if approx_size > *entry {
+            self.total_disk_bytes = self.total_disk_bytes.saturating_add(approx_size - *entry);
+            *entry = approx_size;
+        }
+    }
+
+    fn enforce_cache_budget(&mut self, active_key: ChunkKey) {
+        let budget = self
+            .max_cache_bytes
+            .load(Ordering::Relaxed)
+            .max(MIN_CACHE_BUDGET_BYTES);
+        if self.total_disk_bytes <= budget {
+            return;
+        }
+        let max_chunk_for_file = self
+            .disk_chunks
+            .keys()
+            .filter(|k| k.file_id == active_key.file_id)
+            .map(|k| k.chunk_idx)
+            .max()
+            .unwrap_or(0);
+
+        let mut scanned = 0usize;
+        let len = self.disk_lru.len();
+        while self.total_disk_bytes > budget && scanned < len {
+            let Some(oldest) = self.disk_lru.pop_front() else {
+                break;
+            };
+            scanned += 1;
+            // Pin opening header chunks (0..=1), tail chunk, and the chunk currently being written
+            let is_pinned = oldest == active_key
+                || oldest.chunk_idx <= 1
+                || (oldest.file_id == active_key.file_id && oldest.chunk_idx == max_chunk_for_file);
+            if is_pinned {
+                self.disk_lru.push_back(oldest);
+                continue;
+            }
+            self.handles.remove(&oldest);
+            self.lru.retain(|k| *k != oldest);
+            let path = self.chunk_path(oldest);
+            if std::fs::remove_file(&path).is_ok() || !path.exists() {
+                if let Some(sz) = self.disk_chunks.remove(&oldest) {
+                    self.total_disk_bytes = self.total_disk_bytes.saturating_sub(sz);
+                }
+            } else {
+                self.disk_lru.push_back(oldest);
+            }
+        }
     }
 
     fn touch_lru(&mut self, key: ChunkKey) {
@@ -98,6 +165,9 @@ impl HandlePool {
         self.closed = true;
         self.handles.clear();
         self.lru.clear();
+        self.disk_chunks.clear();
+        self.disk_lru.clear();
+        self.total_disk_bytes = 0;
     }
 
     fn remove_file_chunks(&mut self, file_id: usize) {
@@ -132,8 +202,12 @@ pub struct SparseChunkStorage {
 
 impl SparseChunkStorage {
     pub fn new(root: PathBuf) -> Self {
+        Self::with_budget(root, Arc::new(AtomicU64::new(512 * 1024 * 1024)))
+    }
+
+    pub fn with_budget(root: PathBuf, max_cache_bytes: Arc<AtomicU64>) -> Self {
         Self {
-            pool: Arc::new(Mutex::new(HandlePool::new(root))),
+            pool: Arc::new(Mutex::new(HandlePool::new(root, max_cache_bytes))),
         }
     }
 
@@ -212,6 +286,9 @@ impl TorrentStorage for SparseChunkStorage {
             let file = guard.get_or_open(key, true)?;
             file.seek(SeekFrom::Start(in_chunk as u64))?;
             file.write_all(&buf[buf_pos..buf_pos + take])?;
+            let end_pos = (in_chunk + take) as u64;
+            guard.touch_disk_lru(key, end_pos);
+            guard.enforce_cache_budget(key);
 
             buf_pos += take;
             cur_offset += take as u64;
@@ -243,23 +320,26 @@ impl TorrentStorage for SparseChunkStorage {
             .lock()
             .map_err(|_| anyhow!("storage mutex poisoned"))?;
         let root = guard.root.clone();
+        let budget = Arc::clone(&guard.max_cache_bytes);
         guard.close_all();
-        Ok(Box::new(SparseChunkStorage::new(root)))
+        Ok(Box::new(SparseChunkStorage::with_budget(root, budget)))
     }
 }
 
 #[derive(Clone)]
 pub struct SparseChunkStorageFactory {
     current_root: Arc<Mutex<PathBuf>>,
+    max_cache_bytes: Arc<AtomicU64>,
     /// Reference to the active storage instance so the streaming engine can
     /// force-close every open Windows file handle synchronously on player close or app exit.
     active_storage: Arc<Mutex<Option<SparseChunkStorage>>>,
 }
 
 impl SparseChunkStorageFactory {
-    pub fn new(default_root: PathBuf) -> Self {
+    pub fn new(default_root: PathBuf, max_cache_bytes: Arc<AtomicU64>) -> Self {
         Self {
             current_root: Arc::new(Mutex::new(default_root)),
+            max_cache_bytes,
             active_storage: Arc::new(Mutex::new(None)),
         }
     }
@@ -292,7 +372,7 @@ impl StorageFactory for SparseChunkStorageFactory {
             .lock()
             .map_err(|_| anyhow!("root mutex poisoned"))?
             .clone();
-        let storage = SparseChunkStorage::new(root);
+        let storage = SparseChunkStorage::with_budget(root, Arc::clone(&self.max_cache_bytes));
         if let Ok(mut guard) = self.active_storage.lock() {
             *guard = Some(storage.clone());
         }

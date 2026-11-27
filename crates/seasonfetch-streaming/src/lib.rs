@@ -56,6 +56,7 @@ pub struct StartTorrentRequest {
 
 pub(crate) struct ActiveTorrentSession {
     pub session_id: String,
+    pub access_token: String,
     pub torrent_id: usize,
     pub handle: Arc<ManagedTorrent>,
     pub file_idx: usize,
@@ -70,10 +71,12 @@ pub(crate) struct ActiveTorrentSession {
 
 struct EngineInner {
     cache_root: PathBuf,
-    cache_max_bytes: AtomicU64,
+    cache_max_bytes: Arc<AtomicU64>,
     local_origin: String,
     session_counter: AtomicU64,
-    /// Shared sparse chunked storage factory (allows instant handle release on close).
+    /// Monotonic generation counter so switching episodes or stopping cancels in-flight metadata resolution.
+    start_generation: AtomicU64,
+    /// Shared sparse chunked storage factory (allows instant handle release + active budget enforcement).
     storage_factory: SparseChunkStorageFactory,
     /// Optional structured log sink (wired to desktop.log on desktop).
     log_cb: RwLock<Option<LogCallback>>,
@@ -116,12 +119,14 @@ impl TorrentStreamingEngine {
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
+        let cache_max_bytes = Arc::new(AtomicU64::new(cache_max_mb.clamp(64, 16_384) * 1024 * 1024));
         let inner = Arc::new(EngineInner {
             cache_root: cache_root.clone(),
-            cache_max_bytes: AtomicU64::new(cache_max_mb.clamp(64, 16_384) * 1024 * 1024),
+            cache_max_bytes: Arc::clone(&cache_max_bytes),
             local_origin,
             session_counter: AtomicU64::new(1),
-            storage_factory: SparseChunkStorageFactory::new(cache_root),
+            start_generation: AtomicU64::new(1),
+            storage_factory: SparseChunkStorageFactory::new(cache_root, cache_max_bytes),
             log_cb: RwLock::new(None),
             rqbit_session: Mutex::new(None),
             active: RwLock::new(None),
@@ -145,6 +150,10 @@ impl TorrentStreamingEngine {
 
     pub fn cache_dir(&self) -> &Path {
         &self.inner.cache_root
+    }
+
+    pub fn cache_max_bytes(&self) -> u64 {
+        self.inner.cache_max_bytes.load(Ordering::Relaxed)
     }
 
     pub fn set_cache_max_mb(&self, max_mb: u64) {
@@ -177,6 +186,7 @@ impl TorrentStreamingEngine {
     pub(crate) async fn get_stream_target(
         &self,
         session_id: &str,
+        token: &str,
         file_idx: usize,
     ) -> Option<(
         Arc<ManagedTorrent>,
@@ -188,7 +198,7 @@ impl TorrentStreamingEngine {
     )> {
         let guard = self.inner.active.read().await;
         let active = guard.as_ref()?;
-        if active.session_id != session_id {
+        if active.session_id != session_id || !constant_time_eq(&active.access_token, token) {
             return None;
         }
         if file_idx == active.file_idx {
@@ -238,7 +248,11 @@ impl TorrentStreamingEngine {
         request: StartTorrentRequest,
         on_status: Option<StatusCallback>,
     ) -> Result<StreamSessionStatus, String> {
+        let my_gen = self.inner.start_generation.fetch_add(1, Ordering::SeqCst) + 1;
         let _guard = self.inner.lifecycle_lock.lock().await;
+        if self.inner.start_generation.load(Ordering::SeqCst) != my_gen {
+            return Err("Stream initialization cancelled by a newer playback request.".to_string());
+        }
 
         // Clean up any previous stream before starting a new one.
         self.stop_active_locked(None).await;
@@ -253,6 +267,7 @@ impl TorrentStreamingEngine {
         let seq = self.inner.session_counter.fetch_add(1, Ordering::SeqCst);
         let short_hash = &info_hash[..info_hash.len().min(8)];
         let session_id = format!("sf-{seq}-{short_hash}");
+        let access_token = generate_session_token(seq);
         let session_dir = self.inner.cache_root.join(format!("session-{session_id}"));
         tokio::fs::create_dir_all(&session_dir)
             .await
@@ -326,6 +341,9 @@ impl TorrentStreamingEngine {
         let started_at = Instant::now();
         let meta_timeout = Duration::from_secs(45);
         let initialized = loop {
+            if self.inner.start_generation.load(Ordering::SeqCst) != my_gen {
+                break Err("Stream initialization cancelled.".to_string());
+            }
             if started_at.elapsed() >= meta_timeout {
                 break Err(
                     "Timed out waiting for torrent metadata from DHT/trackers (no reachable seeders)."
@@ -438,8 +456,8 @@ impl TorrentStreamingEngine {
 
         let safe_filename = sanitize_url_filename(&file_name);
         let stream_url = format!(
-            "{}/stream/{}/{}/{}",
-            self.inner.local_origin, session_id, selected_idx, safe_filename
+            "{}/stream/{}/{}/{}/{}",
+            self.inner.local_origin, session_id, access_token, selected_idx, safe_filename
         );
 
         let active_http_streams = Arc::new(AtomicU32::new(0));
@@ -632,6 +650,7 @@ impl TorrentStreamingEngine {
 
         *self.inner.active.write().await = Some(ActiveTorrentSession {
             session_id: session_id.clone(),
+            access_token,
             torrent_id,
             handle,
             file_idx: selected_idx,
@@ -650,6 +669,7 @@ impl TorrentStreamingEngine {
 
     /// Stop any active torrent session, disconnect peers, and delete its temporary cache files.
     pub async fn stop_active_session(&self, on_status: Option<StatusCallback>) -> StreamSessionStatus {
+        self.inner.start_generation.fetch_add(1, Ordering::SeqCst);
         let _guard = self.inner.lifecycle_lock.lock().await;
         self.stop_active_locked(on_status).await
     }
@@ -792,6 +812,40 @@ impl TorrentStreamingEngine {
     }
 }
 
+fn generate_session_token(seq: u64) -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    // Rust std `RandomState` initializes per-instance keys directly from OS CSPRNG
+    // (`BCryptGenRandom` on Windows, `getrandom` on Linux/Android).
+    let mut h1 = RandomState::new().build_hasher();
+    h1.write_u64(seq);
+    h1.write_u32(std::process::id());
+    let a = h1.finish();
+    let mut h2 = RandomState::new().build_hasher();
+    h2.write_u64(a.rotate_left(17));
+    h2.write_u64(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0),
+    );
+    let b = h2.finish();
+    format!("{a:016x}{b:016x}")
+}
+
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let ab = a.as_bytes();
+    let bb = b.as_bytes();
+    if ab.len() != bb.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in ab.iter().zip(bb.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 fn normalize_magnet_and_trackers(
     req: &StartTorrentRequest,
 ) -> Result<(String, String, Vec<String>), String> {
@@ -799,9 +853,10 @@ fn normalize_magnet_and_trackers(
     let mut seen: HashSet<String> = HashSet::new();
 
     let mut push_tracker = |tr: &str| {
-        let t = tr.trim();
-        if !t.is_empty() && seen.insert(t.to_string()) {
-            trackers.push(t.to_string());
+        if let Some(valid) = seasonfetch_core::validation::validate_tracker_url(tr) {
+            if seen.insert(valid.clone()) {
+                trackers.push(valid);
+            }
         }
     };
 
@@ -810,7 +865,7 @@ fn normalize_magnet_and_trackers(
         .info_hash
         .as_deref()
         .map(str::trim)
-        .filter(|h| !h.is_empty())
+        .filter(|h| seasonfetch_core::validation::is_valid_info_hash(h))
         .map(|h| h.to_ascii_lowercase());
 
     if let Some(m) = clean_magnet {
@@ -834,10 +889,9 @@ fn normalize_magnet_and_trackers(
     }
 
     let hash = resolved_hash
+        .filter(|h| seasonfetch_core::validation::is_valid_info_hash(h))
         .ok_or_else(|| "A valid BitTorrent magnet URI or 40-character infoHash is required.".to_string())?;
 
-    // Canonicalize to `magnet:?xt=urn:btih:<hash>` because some APIs percent-encode `urn%3Abtih%3A`
-    // while trackers are already passed explicitly via `AddTorrentOptions::trackers`.
     let magnet = format!("magnet:?xt=urn:btih:{hash}");
 
     Ok((magnet, hash, trackers))
@@ -1018,17 +1072,29 @@ mod tests {
         assert!(resp.contains("200 OK"), "expected 200 OK, got: {resp}");
         assert!(resp.contains("seasonfetch-streaming"));
 
-        // Unknown stream session returns 404
+        // Unknown stream session/token returns 404
         let mut conn404 = tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await
             .unwrap();
         conn404
-            .write_all(b"GET /stream/nonexistent/0/video.mkv HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+            .write_all(b"GET /stream/nonexistent/badtoken/0/video.mkv HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
             .await
             .unwrap();
         let mut resp404 = String::new();
         conn404.read_to_string(&mut resp404).await.unwrap();
         assert!(resp404.contains("404 Not Found"), "expected 404, got: {resp404}");
+
+        // Non-loopback Host header (DNS rebinding attempt) returns 403 Forbidden
+        let mut conn403 = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        conn403
+            .write_all(b"GET /health HTTP/1.1\r\nHost: evil.example\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut resp403 = String::new();
+        conn403.read_to_string(&mut resp403).await.unwrap();
+        assert!(resp403.contains("403 Forbidden"), "expected 403, got: {resp403}");
 
         engine.shutdown().await;
         let _ = tokio::fs::remove_dir_all(&tmp).await;

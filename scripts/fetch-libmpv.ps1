@@ -1,6 +1,7 @@
 param(
   [string]$ReleaseTag = "20261111",
-  [string]$AssetName = "mpv-dev-x86_64-20261111-git-bcde6b93cc.7z"
+  [string]$AssetName = "mpv-dev-x86_64-20261111-git-bcde6b93cc.7z",
+  [string]$ExpectedDllSha256 = "88504ee5560942a955405e99dfb5971368e4cf851321f36565bf2a667271db1b"
 )
 
 $ErrorActionPreference = 'Stop'
@@ -11,9 +12,19 @@ $resDir = Join-Path $repoRoot "src-tauri\resources"
 $destDll = Join-Path $resDir "libmpv-2.dll"
 New-Item -ItemType Directory -Force -Path $resDir | Out-Null
 
+function Assert-DllChecksum([string]$path, [string]$expected) {
+  $actual = (Get-FileHash $path -Algorithm SHA256).Hash.ToLowerInvariant()
+  if ($expected -and ($actual -ne $expected.ToLowerInvariant())) {
+    Remove-Item -Force -ErrorAction SilentlyContinue $path
+    throw "SHA-256 mismatch for libmpv-2.dll! Expected $expected, got $actual."
+  }
+  return $actual
+}
+
 if (Test-Path $destDll) {
+  $actualHash = Assert-DllChecksum $destDll $ExpectedDllSha256
   $sizeMb = [math]::Round((Get-Item $destDll).Length / 1MB, 2)
-  Write-Host "libmpv-2.dll already present ($sizeMb MB): $destDll"
+  Write-Host "libmpv-2.dll verified ($sizeMb MB, sha256=$actualHash): $destDll"
   exit 0
 }
 
@@ -46,6 +57,6 @@ if (-not (Test-Path $destDll)) {
   exit 1
 }
 
-$hash = (Get-FileHash $destDll -Algorithm SHA256).Hash.ToLower()
+$hash = Assert-DllChecksum $destDll $ExpectedDllSha256
 $sizeMb = [math]::Round((Get-Item $destDll).Length / 1MB, 2)
-Write-Host "Ready: $destDll ($sizeMb MB, sha256=$hash)"
+Write-Host "Ready & verified: $destDll ($sizeMb MB, sha256=$hash)"

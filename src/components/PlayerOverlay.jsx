@@ -24,6 +24,7 @@ import {
   parseSubtitleDocument
 } from '../player/subtitleEngine.js';
 import {
+  downloadExternalSubtitle,
   isTauriRuntime,
   launchCustomExternalPlayer,
   launchNativeMpv,
@@ -32,6 +33,7 @@ import {
   nativePlayerStop,
   pickSubtitleFile,
   savePlaybackProgress,
+  searchExternalSubtitles,
   startTorrentStream,
   stopTorrentStream,
   subscribeNativePlayerState,
@@ -101,8 +103,9 @@ function formatSizeCompact(bytes) {
 }
 
 export function PlayerOverlay({
-  session, // { mediaKey, title, subtitle, streamUrl, rawPath, magnetUri, torrentRequest, imdbId, mediaType, season, episode, resumeSecs, nextEpisode }
+  session, // Unified MediaSource: { sourceKind, mediaKey, title, subtitle, releaseName, streamUrl, rawPath, magnetUri, torrentRequest, imdbId, mediaType, season, episode, resumeSecs, nextEpisode }
   playerPrefs,
+  subtitlePrefs,
   playerBackend,
   onUpdatePlayerPrefs,
   onOpenMagnet,
@@ -164,7 +167,7 @@ export function PlayerOverlay({
     selectedSubtitleId: null
   });
 
-  // WebView2 HTML5 fallback subtitle state (ASS/SSA + SRT + VTT)
+  // WebView2 HTML5 fallback + Online External Subtitles state (OpenSubtitles / SubDL / Custom Addon)
   const [subCues, setSubCues] = useState([]);
   const [subTrackName, setSubTrackName] = useState('Auto');
   const [subFilePath, setSubFilePath] = useState(session?.subtitleFile || null);
@@ -173,6 +176,13 @@ export function PlayerOverlay({
   const [subVerticalPos, setSubVerticalPos] = useState(playerPrefs?.subtitleVerticalPos ?? 92);
   const [subFontSize, setSubFontSize] = useState(playerPrefs?.subtitleFontSize ?? 26);
   const [preferAssStyling, setPreferAssStyling] = useState(playerPrefs?.preferAssStyling ?? true);
+  const [onlineSubs, setOnlineSubs] = useState([]);
+  const [onlineSubsLoading, setOnlineSubsLoading] = useState(false);
+  const [onlineSubsError, setOnlineSubsError] = useState('');
+  const [onlineSubLang, setOnlineSubLang] = useState(subtitlePrefs?.preferredLanguage || 'eng');
+  const [onlineSubApplyingId, setOnlineSubApplyingId] = useState('');
+  const [onlineSubSearchedKey, setOnlineSubSearchedKey] = useState('');
+  const autoSubAttemptedKeyRef = useRef('');
 
   // Audio tracks for WebView fallback
   const [webAudioTracks, setWebAudioTracks] = useState([]);
@@ -300,9 +310,19 @@ export function PlayerOverlay({
     }, 3200);
   }, []);
 
-  // Enable transparent WebView2 canvas ONLY while native embedded engine (libmpv/libVLC) owns the Win32 surface below
+  // Keep the player backdrop solid dark until native video output is actually
+  // configured and presenting frames — AND never turn WebView2 transparent while
+  // resolving, buffering, showing an error, or switching engines.
+  const showOpaqueBackdrop =
+    !rawTarget ||
+    isExternalMode ||
+    Boolean(videoError) ||
+    (isNativeEngine && !nativeMeta.voConfigured && !playing);
+
+  // Enable transparent WebView2 canvas ONLY when native embedded engine has live frames ready below
   useEffect(() => {
-    if (!isNativeEngine) {
+    const shouldPunchThrough = isNativeEngine && !showOpaqueBackdrop;
+    if (!shouldPunchThrough) {
       document.documentElement.classList.remove('sf-native-video-active');
       return undefined;
     }
@@ -310,7 +330,7 @@ export function PlayerOverlay({
     return () => {
       document.documentElement.classList.remove('sf-native-video-active');
     };
-  }, [isNativeEngine]);
+  }, [isNativeEngine, showOpaqueBackdrop]);
 
   // Mount & drive native embedded playback engine (libmpv / libVLC)
   useEffect(() => {
@@ -657,6 +677,90 @@ export function PlayerOverlay({
     }
   }
 
+  const handleApplyOnlineSubtitle = useCallback(async candidate => {
+    if (!candidate) return;
+    setOnlineSubApplyingId(candidate.id);
+    try {
+      const dl = await downloadExternalSubtitle({
+        candidate,
+        imdbId: session?.imdbId || null,
+        localVideoPath: session?.rawPath || null,
+        saveAlongsideLocal: Boolean(subtitlePrefs?.saveAlongsideLocal && session?.rawPath)
+      });
+      if (!dl?.ok || !dl.localPath) {
+        onToast?.(dl?.error || 'Could not download external subtitle.');
+        return;
+      }
+      setSubFilePath(dl.localPath);
+      if (isNativeEngine) {
+        const res = await nativePlayerCommand('add_subtitle_file', dl.localPath);
+        if (res?.ok) {
+          onToast?.(`Loaded ${candidate.languageLabel} subtitle (${candidate.provider})`);
+        } else {
+          onToast?.(res?.error || 'Subtitle downloaded but could not be attached to active player.');
+        }
+      } else if (dl.content) {
+        const parsed = parseSubtitleDocument(dl.content, dl.format || candidate.format);
+        setSubCues(parsed.cues);
+        setSubTrackName(`${candidate.languageLabel} · ${candidate.releaseName}`);
+        setSubEnabled(true);
+        onToast?.(`Loaded ${parsed.cues.length} external subtitle cues`);
+      }
+    } finally {
+      setOnlineSubApplyingId('');
+    }
+  }, [isNativeEngine, onToast, session?.imdbId, session?.rawPath, subtitlePrefs?.saveAlongsideLocal]);
+
+  const handleSearchOnlineSubtitles = useCallback(async (langOverride, { autoApply = false } = {}) => {
+    const lang = langOverride ?? onlineSubLang;
+    setOnlineSubsLoading(true);
+    setOnlineSubsError('');
+    try {
+      const res = await searchExternalSubtitles({
+        imdbId: session?.imdbId || null,
+        mediaType: session?.mediaType || (session?.season ? 'series' : 'movie'),
+        title: session?.title || null,
+        season: session?.season ? Number(session.season) : null,
+        episode: session?.episode ? Number(session.episode) : null,
+        releaseName: session?.releaseName || streamStatus?.fileName || session?.title || null,
+        localFilePath: session?.rawPath || null,
+        language: lang
+      });
+      const list = Array.isArray(res?.candidates) ? res.candidates : [];
+      setOnlineSubs(list);
+      setOnlineSubSearchedKey(`${session?.mediaKey || ''}:${lang}`);
+      if (!list.length && res?.warnings?.length) {
+        setOnlineSubsError(res.warnings.join(' · '));
+      }
+      if (autoApply && list.length > 0) {
+        await handleApplyOnlineSubtitle(list[0]);
+      }
+    } catch (err) {
+      setOnlineSubsError(err instanceof Error ? err.message : 'External subtitle search failed.');
+    } finally {
+      setOnlineSubsLoading(false);
+    }
+  }, [handleApplyOnlineSubtitle, onlineSubLang, session, streamStatus?.fileName]);
+
+  // Auto-search online subtitles when user opens the Subtitles drawer
+  useEffect(() => {
+    if (activeDrawer !== 'subtitles') return;
+    const key = `${session?.mediaKey || ''}:${onlineSubLang}`;
+    if (onlineSubSearchedKey !== key && !onlineSubsLoading && (session?.imdbId || session?.rawPath)) {
+      handleSearchOnlineSubtitles(onlineSubLang);
+    }
+  }, [activeDrawer, handleSearchOnlineSubtitles, onlineSubLang, onlineSubSearchedKey, onlineSubsLoading, session?.imdbId, session?.mediaKey, session?.rawPath]);
+
+  // Auto-select best matching external subtitle when enabled and video starts with no embedded subtitles
+  useEffect(() => {
+    if (!subtitlePrefs?.autoSelect || !playing || !session?.mediaKey) return;
+    if (autoSubAttemptedKeyRef.current === session.mediaKey) return;
+    if (isNativeEngine && nativeMeta.subtitleTracks.length > 0) return;
+    if (!session?.imdbId && !session?.rawPath) return;
+    autoSubAttemptedKeyRef.current = session.mediaKey;
+    handleSearchOnlineSubtitles(subtitlePrefs?.preferredLanguage || 'eng', { autoApply: true });
+  }, [handleSearchOnlineSubtitles, isNativeEngine, nativeMeta.subtitleTracks.length, playing, session?.imdbId, session?.mediaKey, session?.rawPath, subtitlePrefs?.autoSelect, subtitlePrefs?.preferredLanguage]);
+
   async function handleLaunchExternalPlayer() {
     if (!rawTarget) return;
     if (isNativeEngine) {
@@ -716,13 +820,6 @@ export function PlayerOverlay({
     playerBackend?.mpvAvailable ||
     playerBackend?.vlcAvailable
   );
-
-  // Keep the player backdrop solid dark until native video output is actually
-  // configured and presenting frames (prevents transparent window bleed-through).
-  const showOpaqueBackdrop =
-    !rawTarget ||
-    isExternalMode ||
-    (isNativeEngine && !nativeMeta.voConfigured && !playing);
 
   const hwBadge = useMemo(() => {
     if (isExternalMode) return 'Custom';
@@ -1125,6 +1222,69 @@ export function PlayerOverlay({
               </label>
             </>
           )}
+
+          {/* Direct Online External Subtitles (OpenSubtitles / SubDL / Custom Addon) */}
+          <div style={{ marginTop: 12, paddingTop: 10, borderTop: '1px solid rgba(255,255,255,0.08)' }}>
+            <div className="sf-drawer-row" style={{ marginBottom: 8 }}>
+              <strong>Online Subtitles</strong>
+              <div className="sf-btn-row">
+                <select
+                  className="sf-select sf-sm"
+                  value={onlineSubLang}
+                  onChange={e => {
+                    const nextLang = e.target.value;
+                    setOnlineSubLang(nextLang);
+                    handleSearchOnlineSubtitles(nextLang);
+                  }}
+                >
+                  <option value="eng">English</option>
+                  <option value="ara">Arabic</option>
+                  <option value="spa">Spanish</option>
+                  <option value="fre">French</option>
+                  <option value="ger">German</option>
+                  <option value="por">Portuguese</option>
+                  <option value="jpn">Japanese</option>
+                  <option value="any">All Languages</option>
+                </select>
+                <button
+                  type="button"
+                  className="sf-secondary-btn sf-sm"
+                  disabled={onlineSubsLoading}
+                  onClick={() => handleSearchOnlineSubtitles(onlineSubLang)}
+                >
+                  {onlineSubsLoading ? 'Searching...' : 'Search'}
+                </button>
+              </div>
+            </div>
+            {onlineSubsError && <p className="sf-muted-sm">{onlineSubsError}</p>}
+            {onlineSubs.length > 0 && (
+              <div className="sf-track-list" style={{ maxHeight: 170, overflowY: 'auto' }}>
+                {onlineSubs.slice(0, 12).map(sub => (
+                  <button
+                    key={sub.id}
+                    type="button"
+                    className="sf-track-item"
+                    disabled={onlineSubApplyingId === sub.id}
+                    onClick={() => handleApplyOnlineSubtitle(sub)}
+                  >
+                    <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {sub.languageLabel} · {sub.releaseName}
+                    </span>
+                    <span className="sf-mini-tag">
+                      {onlineSubApplyingId === sub.id
+                        ? '...'
+                        : sub.hashMatched
+                          ? `HASH · ${sub.format.toUpperCase()}`
+                          : sub.format.toUpperCase()}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            )}
+            {!onlineSubsLoading && onlineSubs.length === 0 && onlineSubSearchedKey && !onlineSubsError && (
+              <p className="sf-muted-sm">No external subtitles found for this filter. Try &ldquo;All Languages&rdquo; or load a local subtitle file above.</p>
+            )}
+          </div>
         </div>
       )}
 
@@ -1151,7 +1311,7 @@ export function PlayerOverlay({
                 <option value="embedded-libmpv">Embedded libmpv (Recommended)</option>
               )}
               {playerBackend?.libvlcAvailable && (
-                <option value="embedded-libvlc">Embedded libVLC (System VLC)</option>
+                <option value="embedded-libvlc">Embedded libVLC (Built-in)</option>
               )}
               {hasExternalPlayerConfigured && (
                 <option value="external-player">External Player (Custom .exe)</option>

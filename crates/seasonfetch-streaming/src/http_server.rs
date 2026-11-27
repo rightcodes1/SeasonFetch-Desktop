@@ -3,7 +3,7 @@ use axum::body::Body;
 use axum::extract::{Path as AxumPath, State};
 use axum::http::{header, HeaderMap, HeaderValue, Response, StatusCode};
 use axum::routing::get;
-use axum::{Json, Router};
+use axum::Router;
 use seasonfetch_core::streaming::{content_type_for_filename, parse_http_byte_range};
 use std::io::SeekFrom;
 use std::pin::Pin;
@@ -104,6 +104,19 @@ impl<R: AsyncRead + Unpin> AsyncRead for TrackedReader<R> {
     }
 }
 
+fn is_loopback_host(headers: &HeaderMap) -> bool {
+    let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    let host_only = host
+        .trim()
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(host_only.as_str(), "127.0.0.1" | "localhost")
+}
+
 pub(crate) fn spawn_http_server(
     listener: TcpListener,
     engine: TorrentStreamingEngine,
@@ -111,13 +124,12 @@ pub(crate) fn spawn_http_server(
 ) {
     let router = Router::new()
         .route("/health", get(health_handler))
-        .route("/status", get(status_handler))
         .route(
-            "/stream/{session_id}/{file_idx}",
+            "/stream/{session_id}/{token}/{file_idx}",
             get(stream_get_no_name).head(stream_head_no_name),
         )
         .route(
-            "/stream/{session_id}/{file_idx}/{filename}",
+            "/stream/{session_id}/{token}/{file_idx}/{filename}",
             get(stream_get_with_name).head(stream_head_with_name),
         )
         .with_state(engine);
@@ -130,53 +142,69 @@ pub(crate) fn spawn_http_server(
     });
 }
 
-async fn health_handler() -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "ok": true, "engine": "seasonfetch-streaming" }))
-}
-
-async fn status_handler(
-    State(engine): State<TorrentStreamingEngine>,
-) -> Json<seasonfetch_core::streaming::StreamSessionStatus> {
-    Json(engine.current_status().await)
+async fn health_handler(headers: HeaderMap) -> Response<Body> {
+    if !is_loopback_host(&headers) {
+        return Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .body(Body::empty())
+            .unwrap();
+    }
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::json!({ "ok": true, "engine": "seasonfetch-streaming" }).to_string(),
+        ))
+        .unwrap()
 }
 
 async fn stream_head_no_name(
     State(engine): State<TorrentStreamingEngine>,
-    AxumPath((session_id, file_idx)): AxumPath<(String, usize)>,
+    AxumPath((session_id, token, file_idx)): AxumPath<(String, String, usize)>,
+    headers: HeaderMap,
 ) -> Response<Body> {
-    serve_head(engine, &session_id, file_idx).await
+    serve_head(engine, &session_id, &token, file_idx, &headers).await
 }
 
 async fn stream_head_with_name(
     State(engine): State<TorrentStreamingEngine>,
-    AxumPath((session_id, file_idx, _filename)): AxumPath<(String, usize, String)>,
+    AxumPath((session_id, token, file_idx, _filename)): AxumPath<(String, String, usize, String)>,
+    headers: HeaderMap,
 ) -> Response<Body> {
-    serve_head(engine, &session_id, file_idx).await
+    serve_head(engine, &session_id, &token, file_idx, &headers).await
 }
 
 async fn stream_get_no_name(
     State(engine): State<TorrentStreamingEngine>,
-    AxumPath((session_id, file_idx)): AxumPath<(String, usize)>,
+    AxumPath((session_id, token, file_idx)): AxumPath<(String, String, usize)>,
     headers: HeaderMap,
 ) -> Response<Body> {
-    serve_get(engine, &session_id, file_idx, headers).await
+    serve_get(engine, &session_id, &token, file_idx, headers).await
 }
 
 async fn stream_get_with_name(
     State(engine): State<TorrentStreamingEngine>,
-    AxumPath((session_id, file_idx, _filename)): AxumPath<(String, usize, String)>,
+    AxumPath((session_id, token, file_idx, _filename)): AxumPath<(String, String, usize, String)>,
     headers: HeaderMap,
 ) -> Response<Body> {
-    serve_get(engine, &session_id, file_idx, headers).await
+    serve_get(engine, &session_id, &token, file_idx, headers).await
 }
 
 async fn serve_head(
     engine: TorrentStreamingEngine,
     session_id: &str,
+    token: &str,
     file_idx: usize,
+    headers: &HeaderMap,
 ) -> Response<Body> {
+    if !is_loopback_host(headers) {
+        return Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .body(Body::empty())
+            .unwrap();
+    }
     let Some((_handle, _idx, file_name, file_len, _counter, _cancel_rx)) =
-        engine.get_stream_target(session_id, file_idx).await
+        engine.get_stream_target(session_id, token, file_idx).await
     else {
         return Response::builder()
             .status(StatusCode::NOT_FOUND)
@@ -197,15 +225,22 @@ async fn serve_head(
 async fn serve_get(
     engine: TorrentStreamingEngine,
     session_id: &str,
+    token: &str,
     file_idx: usize,
     headers: HeaderMap,
 ) -> Response<Body> {
+    if !is_loopback_host(&headers) {
+        return Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .body(Body::from("Forbidden host header"))
+            .unwrap();
+    }
     let Some((handle, idx, file_name, file_len, active_counter, cancel_rx)) =
-        engine.get_stream_target(session_id, file_idx).await
+        engine.get_stream_target(session_id, token, file_idx).await
     else {
         return Response::builder()
             .status(StatusCode::NOT_FOUND)
-            .body(Body::from("Streaming session not found or already closed"))
+            .body(Body::from("Streaming session not found or unauthorized"))
             .unwrap();
     };
 

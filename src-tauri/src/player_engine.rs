@@ -2,13 +2,12 @@ use crate::native_player::NativePlaybackManager;
 use seasonfetch_core::models::PlayerPreferences;
 use seasonfetch_core::player::{select_best_engine, PlaybackBackendInfo, PlaybackEngineOption};
 use seasonfetch_core::streaming::{
-    resolve_playback_source, ResolvedPlaybackSource, StreamingEngineStatus, STREMIO_LOCAL_ORIGIN,
+    resolve_playback_source, ResolvedPlaybackSource, StreamingEngineStatus,
 };
 use seasonfetch_streaming::TorrentStreamingEngine;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::Duration;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -121,7 +120,7 @@ pub fn get_playback_backend_info(
     let engines = vec![
         PlaybackEngineOption {
             id: "embedded-libmpv".to_string(),
-            name: "Embedded libmpv (Recommended — Stremio Engine)".to_string(),
+            name: "Embedded libmpv (Default — Built-in)".to_string(),
             available: libmpv_available,
             embedded: true,
             supports_mkv_hevc: true,
@@ -136,18 +135,18 @@ pub fn get_playback_backend_info(
         },
         PlaybackEngineOption {
             id: "embedded-libvlc".to_string(),
-            name: "Embedded libVLC (Optional — System VLC)".to_string(),
+            name: "Embedded libVLC (Built-in Alternative)".to_string(),
             available: libvlc_available,
             embedded: true,
             supports_mkv_hevc: true,
             supports_native_libass: true,
             supports_hwdec: true,
             detail: if let Some(ver) = &libvlc_version {
-                format!("{ver} · Uses existing Windows VLC install (not bundled to avoid ~100 MB plugin bloat)")
+                format!("{ver} · Full native alternative engine (MKV/HEVC/MP4/WebM, multi-audio & subtitles)")
             } else {
-                "System 64-bit VLC (libvlc.dll) not installed. Optional secondary backend.".to_string()
+                "Bundled or system 64-bit libvlc.dll not detected. Run scripts/fetch-libvlc.ps1 to bundle locally.".to_string()
             },
-            license_note: "LGPL-2.1+ (dynamically loaded from system VLC installation; limited real-time subtitle position/scale control compared to libmpv).".to_string(),
+            license_note: "LGPL-2.1+ (dynamically loaded from bundled resources/vlc/ or system VLC installation).".to_string(),
         },
         PlaybackEngineOption {
             id: "webview".to_string(),
@@ -197,25 +196,9 @@ pub fn get_playback_backend_info(
     }
 }
 
-pub async fn probe_stremio_service() -> bool {
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_millis(650))
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-
-    match client.get(format!("{STREMIO_LOCAL_ORIGIN}/settings.json")).send().await {
-        Ok(resp) => resp.status().is_success() || resp.status().as_u16() < 500,
-        Err(_) => false,
-    }
-}
-
 pub async fn get_streaming_engine_status(
     streaming: Option<&TorrentStreamingEngine>,
 ) -> StreamingEngineStatus {
-    let stremio_up = probe_stremio_service().await;
     if let Some(engine) = streaming {
         let active_session = engine.current_status().await;
         let cache_size = engine.cache_size_bytes().await;
@@ -228,8 +211,6 @@ pub async fn get_streaming_engine_status(
             integrated_torrent_engine_active: true,
             engine_name: "SeasonFetch Embedded Torrent Engine (librqbit)".to_string(),
             local_http_origin: Some(engine.local_origin().to_string()),
-            stremio_service_reachable: stremio_up,
-            stremio_service_origin: STREMIO_LOCAL_ORIGIN.to_string(),
             active_session: if has_active {
                 Some(active_session)
             } else {
@@ -237,12 +218,13 @@ pub async fn get_streaming_engine_status(
             },
             cache_dir: Some(engine.cache_dir().to_string_lossy().to_string()),
             cache_size_bytes: cache_size,
+            cache_max_bytes: engine.cache_max_bytes(),
             capabilities: vec![
                 "Built-in BitTorrent magnet streaming (DHT + trackers + metadata resolution)".to_string(),
-                "Local loopback HTTP Range (206) streaming & seeking without downloading full file".to_string(),
-                "Automatic episode file selection & single-file filtering for season packs".to_string(),
-                "Direct embedded libmpv playback (MKV, HEVC, AV1, AC3/DTS, styled ASS/SSA libass)".to_string(),
-                "Automatic session teardown and temporary cache cleanup on close".to_string(),
+                "Token-protected loopback HTTP Range (206) streaming & seeking without downloading full file".to_string(),
+                "Automatic episode file selection & parallel head+tail prewarm".to_string(),
+                "Direct embedded libmpv & libVLC playback (MKV, HEVC, AV1, AC3/DTS, styled ASS/SSA)".to_string(),
+                "Active cache-budget enforcement and automatic teardown cleanup on close".to_string(),
             ],
             limitations: vec![
                 "Torrents with zero reachable seeders cannot stream until peers become available.".to_string(),
@@ -252,17 +234,12 @@ pub async fn get_streaming_engine_status(
 
     StreamingEngineStatus {
         integrated_torrent_engine_active: false,
-        engine_name: if stremio_up {
-            "External Local Torrent Bridge (127.0.0.1:11470)".to_string()
-        } else {
-            "Direct HTTP/HTTPS & Local File Playback".to_string()
-        },
+        engine_name: "Direct HTTP/HTTPS & Local File Playback".to_string(),
         local_http_origin: None,
-        stremio_service_reachable: stremio_up,
-        stremio_service_origin: STREMIO_LOCAL_ORIGIN.to_string(),
         active_session: None,
         cache_dir: None,
         cache_size_bytes: 0,
+        cache_max_bytes: 0,
         capabilities: vec![
             "Local media files (MP4, MKV, WebM, MOV)".to_string(),
             "Direct HTTP/HTTPS video streams".to_string(),
@@ -279,11 +256,6 @@ pub async fn resolve_source_command(
     args: ResolveSourceArgs,
     embedded_engine_ready: bool,
 ) -> ResolvedPlaybackSource {
-    let stremio_up = if embedded_engine_ready {
-        false
-    } else {
-        probe_stremio_service().await
-    };
     resolve_playback_source(
         &args.title,
         args.direct_url.as_deref(),
@@ -292,7 +264,6 @@ pub async fn resolve_source_command(
         args.info_hash.as_deref(),
         args.file_idx,
         embedded_engine_ready,
-        stremio_up,
     )
 }
 

@@ -3,19 +3,55 @@ use url::Url;
 
 /// Explicit separation of playback source resolution from streaming and playback engines.
 ///
-/// 1. Source Discovery   -> Cinemeta + Torrentio via existing SeasonFetch backend
-/// 2. Source Resolution  -> Classifying direct HTTP/HTTPS streams, local media files, embedded torrent streams, vs raw magnet URIs
+/// 1. Source Discovery   -> Direct Cinemeta + direct Torrentio addon adapters inside desktop
+/// 2. Unified MediaSource-> Standardizes torrent streams, local files, downloaded media, and direct HTTP streams
 /// 3. Streaming Engine   -> Converts a torrent/magnet (metadata, file selection, piece prioritization, HTTP Range seeking, peer management, cache cleanup) into a local HTTP stream (`crates/seasonfetch-streaming`)
-/// 4. Playback Engine    -> Renders video, audio, and styled ASS/SSA subtitles (Windows: embedded libmpv/libVLC; Android: Media3/ExoPlayer)
+/// 4. Playback Engine    -> Renders video, audio, and styled ASS/SSA subtitles (Windows: bundled libmpv/libVLC; Android: Media3/ExoPlayer)
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum StreamSourceKind {
     LocalFile,
+    Downloaded,
     DirectHttp,
     EmbeddedTorrent,
-    LocalTorrentBridge,
     RawMagnet,
+}
+
+/// Unified media source model consumed identically by the playback manager regardless of
+/// whether the video originates from a live torrent stream, a local file, or a completed download.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaSource {
+    pub kind: StreamSourceKind,
+    pub media_key: String,
+    pub title: String,
+    #[serde(default)]
+    pub subtitle: Option<String>,
+    #[serde(default)]
+    pub imdb_id: Option<String>,
+    #[serde(default)]
+    pub media_type: Option<String>,
+    #[serde(default)]
+    pub season: Option<u32>,
+    #[serde(default)]
+    pub episode: Option<u32>,
+    #[serde(default)]
+    pub resume_secs: f64,
+    #[serde(default)]
+    pub local_path: Option<String>,
+    #[serde(default)]
+    pub direct_url: Option<String>,
+    #[serde(default)]
+    pub magnet_uri: Option<String>,
+    #[serde(default)]
+    pub info_hash: Option<String>,
+    #[serde(default)]
+    pub file_idx: Option<usize>,
+    #[serde(default)]
+    pub release_name: Option<String>,
+    #[serde(default)]
+    pub subtitle_file: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -107,18 +143,15 @@ pub struct StreamingEngineStatus {
     pub engine_name: String,
     #[serde(default)]
     pub local_http_origin: Option<String>,
-    pub stremio_service_reachable: bool,
-    pub stremio_service_origin: String,
     #[serde(default)]
     pub active_session: Option<StreamSessionStatus>,
     #[serde(default)]
     pub cache_dir: Option<String>,
     pub cache_size_bytes: u64,
+    pub cache_max_bytes: u64,
     pub capabilities: Vec<String>,
     pub limitations: Vec<String>,
 }
-
-pub const STREMIO_LOCAL_ORIGIN: &str = "http://127.0.0.1:11470";
 
 /// Reliable public BitTorrent trackers appended to Torrentio magnet URIs (deduplicated)
 /// so peer discovery succeeds rapidly even on magnets with sparse tracker lists.
@@ -306,7 +339,6 @@ pub fn resolve_playback_source(
     info_hash: Option<&str>,
     file_idx: Option<i64>,
     embedded_engine_ready: bool,
-    stremio_service_reachable: bool,
 ) -> ResolvedPlaybackSource {
     if let Some(path) = local_file_path.map(str::trim).filter(|s| !s.is_empty()) {
         return ResolvedPlaybackSource {
@@ -317,7 +349,7 @@ pub fn resolve_playback_source(
             info_hash: None,
             file_idx: None,
             title: title.to_string(),
-            subtitle_note: Some("Local media file ready for embedded libmpv playback.".to_string()),
+            subtitle_note: Some("Local media file ready for embedded native playback.".to_string()),
             reason: None,
         };
     }
@@ -343,7 +375,7 @@ pub fn resolve_playback_source(
     let clean_magnet = magnet_uri.map(str::trim).filter(|s| !s.is_empty());
     let resolved_hash = info_hash
         .map(str::trim)
-        .filter(|h| h.len() == 40 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+        .filter(|h| crate::validation::is_valid_info_hash(h))
         .map(|h| h.to_ascii_lowercase())
         .or_else(|| clean_magnet.and_then(extract_info_hash_from_magnet));
 
@@ -361,24 +393,6 @@ pub fn resolve_playback_source(
         };
     }
 
-    if stremio_service_reachable {
-        if let (Some(hash), Some(idx)) = (resolved_hash.as_deref(), file_idx) {
-            if idx >= 0 {
-                return ResolvedPlaybackSource {
-                    kind: StreamSourceKind::LocalTorrentBridge,
-                    playable_in_app: true,
-                    stream_url: Some(format!("{STREMIO_LOCAL_ORIGIN}/{hash}/{idx}")),
-                    magnet_uri: clean_magnet.map(str::to_string),
-                    info_hash: Some(hash.to_string()),
-                    file_idx: Some(idx),
-                    title: title.to_string(),
-                    subtitle_note: Some("Streaming via local torrent streaming bridge on 127.0.0.1:11470.".to_string()),
-                    reason: None,
-                };
-            }
-        }
-    }
-
     ResolvedPlaybackSource {
         kind: StreamSourceKind::RawMagnet,
         playable_in_app: false,
@@ -389,7 +403,7 @@ pub fn resolve_playback_source(
         title: title.to_string(),
         subtitle_note: None,
         reason: Some(
-            "Embedded torrent streaming engine is not active in this environment. Use Open Magnet Externally or play a downloaded local file.".to_string(),
+            "Embedded torrent streaming engine is unavailable on this launch. Restart SeasonFetch or use an explicit Download action.".to_string(),
         ),
     }
 }
@@ -400,30 +414,25 @@ mod tests {
 
     #[test]
     fn distinguishes_playable_sources_from_raw_magnets() {
-        let local = resolve_playback_source("Episode 1", None, Some("C:\\Videos\\ep1.mkv"), None, None, None, true, false);
+        let local = resolve_playback_source("Episode 1", None, Some("C:\\Videos\\ep1.mkv"), None, None, None, true);
         assert!(local.playable_in_app);
         assert_eq!(local.kind, StreamSourceKind::LocalFile);
 
-        let direct = resolve_playback_source("Trailer", Some("https://cdn.example/video.mp4"), None, None, None, None, true, false);
+        let direct = resolve_playback_source("Trailer", Some("https://cdn.example/video.mp4"), None, None, None, None, true);
         assert!(direct.playable_in_app);
         assert_eq!(direct.kind, StreamSourceKind::DirectHttp);
 
         let hash = "0123456789abcdef0123456789abcdef01234567";
         let magnet = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567";
 
-        let embedded = resolve_playback_source("Episode 1", None, None, Some(magnet), Some(hash), Some(0), true, false);
+        let embedded = resolve_playback_source("Episode 1", None, None, Some(magnet), Some(hash), Some(0), true);
         assert!(embedded.playable_in_app);
         assert_eq!(embedded.kind, StreamSourceKind::EmbeddedTorrent);
         assert_eq!(embedded.info_hash.as_deref(), Some(hash));
 
-        let raw_magnet = resolve_playback_source("Episode 1", None, None, Some(magnet), Some(hash), Some(0), false, false);
+        let raw_magnet = resolve_playback_source("Episode 1", None, None, Some(magnet), Some(hash), Some(0), false);
         assert!(!raw_magnet.playable_in_app);
         assert_eq!(raw_magnet.kind, StreamSourceKind::RawMagnet);
-
-        let bridged = resolve_playback_source("Episode 1", None, None, Some(magnet), Some(hash), Some(0), false, true);
-        assert!(bridged.playable_in_app);
-        assert_eq!(bridged.kind, StreamSourceKind::LocalTorrentBridge);
-        assert_eq!(bridged.stream_url.as_deref(), Some("http://127.0.0.1:11470/0123456789abcdef0123456789abcdef01234567/0"));
     }
 
     #[test]

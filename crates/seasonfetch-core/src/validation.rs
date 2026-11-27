@@ -3,11 +3,12 @@ use url::Url;
 use crate::models::DEFAULT_BACKEND_URL;
 
 pub const ALLOWED_METHODS: &[&str] = &["GET", "POST", "PUT", "PATCH", "DELETE"];
+/// Strict architectural boundary: the SeasonFetch website backend is used ONLY
+/// for account synchronization (session, personal library, and active-day sync).
+/// Media metadata (Cinemeta), source discovery (Torrentio), subtitles, and streaming
+/// run natively inside the desktop application.
 pub const ALLOWED_API_PREFIXES: &[&str] = &[
     "/api/health",
-    "/api/cinemeta/",
-    "/api/torrentio/",
-    "/api/gemini/",
     "/api/account/",
     "/api/library",
     "/api/activity",
@@ -112,6 +113,97 @@ pub fn validate_api_url(method: &str, raw_path: &str, backend_origin: &str) -> R
     }
 
     Ok(target.to_string())
+}
+
+pub fn is_valid_info_hash(raw: &str) -> bool {
+    let clean = raw.trim();
+    let is_hex40 = clean.len() == 40 && clean.bytes().all(|b| b.is_ascii_hexdigit());
+    let is_b32 = clean.len() == 32
+        && clean
+            .bytes()
+            .all(|b| matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'2'..=b'7'));
+    is_hex40 || is_b32
+}
+
+fn is_disallowed_host(host: &str) -> bool {
+    let lower = host.trim().trim_matches(|c| c == '[' || c == ']').to_ascii_lowercase();
+    if lower.is_empty()
+        || lower == "localhost"
+        || lower.ends_with(".localhost")
+        || lower.ends_with(".local")
+        || lower.ends_with(".internal")
+    {
+        return true;
+    }
+    if let Ok(ip) = lower.parse::<std::net::IpAddr>() {
+        return match ip {
+            std::net::IpAddr::V4(v4) => {
+                v4.is_loopback()
+                    || v4.is_private()
+                    || v4.is_link_local()
+                    || v4.is_unspecified()
+                    || v4.is_broadcast()
+                    || v4.is_multicast()
+            }
+            std::net::IpAddr::V6(v6) => {
+                v6.is_loopback()
+                    || v6.is_unspecified()
+                    || v6.is_multicast()
+                    || (v6.segments()[0] & 0xfe00) == 0xfc00
+                    || (v6.segments()[0] & 0xffc0) == 0xfe80
+            }
+        };
+    }
+    false
+}
+
+/// Validates a BitTorrent tracker URL (`udp://`, `http://`, `https://`, `wss://`),
+/// rejecting credentials and private/loopback addresses to prevent SSRF.
+pub fn validate_tracker_url(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > 512 {
+        return None;
+    }
+    let parsed = Url::parse(trimmed).ok()?;
+    if !matches!(parsed.scheme(), "udp" | "http" | "https" | "wss") {
+        return None;
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return None;
+    }
+    let host = parsed.host_str()?;
+    if is_disallowed_host(host) {
+        return None;
+    }
+    Some(parsed.to_string())
+}
+
+/// Validates an external HTTPS addon base URL (e.g. Torrentio or subtitle addon),
+/// normalizing away any trailing slash or `/manifest.json`.
+pub fn validate_addon_base_url(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > 512 {
+        return None;
+    }
+    let parsed = Url::parse(trimmed).ok()?;
+    if parsed.scheme() != "https" {
+        return None;
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return None;
+    }
+    let host = parsed.host_str()?;
+    if is_disallowed_host(host) {
+        return None;
+    }
+    let mut normalized = parsed.to_string();
+    while normalized.ends_with('/') {
+        normalized.pop();
+    }
+    if let Some(stripped) = normalized.strip_suffix("/manifest.json") {
+        normalized = stripped.to_string();
+    }
+    Some(normalized)
 }
 
 pub fn is_valid_bt_xt(xt: &str) -> bool {
@@ -249,11 +341,32 @@ mod tests {
     #[test]
     fn validates_api_routes_and_blocks_traversal() {
         assert!(validate_api_url("GET", "/api/health", DEFAULT_BACKEND_URL).is_ok());
-        assert!(validate_api_url("GET", "/api/cinemeta/search?q=dark&type=series", DEFAULT_BACKEND_URL).is_ok());
-        assert!(validate_api_url("GET", "/api/cinemeta/../health", DEFAULT_BACKEND_URL).is_err());
-        assert!(validate_api_url("GET", "/api/cinemeta/%2e%2e/health", DEFAULT_BACKEND_URL).is_err());
+        assert!(validate_api_url("GET", "/api/library", DEFAULT_BACKEND_URL).is_ok());
+        assert!(validate_api_url("GET", "/api/account/session", DEFAULT_BACKEND_URL).is_ok());
+        assert!(validate_api_url("POST", "/api/activity/active-day", DEFAULT_BACKEND_URL).is_ok());
+        // Media discovery/provider routes must NOT hit the website backend anymore
+        assert!(validate_api_url("GET", "/api/cinemeta/search?q=dark&type=series", DEFAULT_BACKEND_URL).is_err());
+        assert!(validate_api_url("GET", "/api/torrentio/movie/tt0133093", DEFAULT_BACKEND_URL).is_err());
+        assert!(validate_api_url("GET", "/api/gemini/status", DEFAULT_BACKEND_URL).is_err());
+        assert!(validate_api_url("GET", "/api/library/../health", DEFAULT_BACKEND_URL).is_err());
+        assert!(validate_api_url("GET", "/api/library/%2e%2e/health", DEFAULT_BACKEND_URL).is_err());
         assert!(validate_api_url("GET", "//evil.test/api/health", DEFAULT_BACKEND_URL).is_err());
         assert!(validate_api_url("GET", "/api/internal/secrets", DEFAULT_BACKEND_URL).is_err());
+    }
+
+    #[test]
+    fn validates_trackers_info_hashes_and_addons() {
+        assert!(is_valid_info_hash("0123456789abcdef0123456789abcdef01234567"));
+        assert!(!is_valid_info_hash("not-a-hash"));
+        assert!(validate_tracker_url("udp://tracker.opentrackr.org:1337/announce").is_some());
+        assert!(validate_tracker_url("http://127.0.0.1:8080/announce").is_none());
+        assert!(validate_tracker_url("http://192.168.1.5/announce").is_none());
+        assert!(validate_tracker_url("file:///etc/passwd").is_none());
+        assert_eq!(
+            validate_addon_base_url("https://torrentio.strem.fun/manifest.json").as_deref(),
+            Some("https://torrentio.strem.fun")
+        );
+        assert!(validate_addon_base_url("http://torrentio.strem.fun").is_none());
     }
 
     #[test]

@@ -160,20 +160,84 @@ export async function searchCatalog(query, mediaType = 'series', mode = 'full') 
   const cleanQuery = String(query ?? '').trim();
   const mt = mediaType === 'movie' ? 'movie' : 'series';
   const searchMode = mode === 'autocomplete' ? 'autocomplete' : 'full';
-  const params = new URLSearchParams({ q: cleanQuery, type: mt, mode: searchMode });
-  return desktopApiRequest({
-    method: 'GET',
-    path: `/api/cinemeta/search?${params.toString()}`,
-    timeoutMs: 12000
-  });
+  if (isTauriRuntime()) {
+    return invoke('cinemeta_search', { query: cleanQuery, mediaType: mt, mode: searchMode });
+  }
+  // Direct Cinemeta fallback outside Tauri (never uses website backend)
+  try {
+    const res = await fetch(`https://v3-cinemeta.strem.io/catalog/${mt}/top/search=${encodeURIComponent(cleanQuery)}.json`);
+    const json = await res.json();
+    const results = (json.metas || []).slice(0, searchMode === 'autocomplete' ? 10 : 32).map(m => ({
+      id: m.imdb_id || m.id,
+      imdbId: m.imdb_id || m.id,
+      mediaType: mt,
+      title: m.name,
+      year: m.releaseInfo || (m.year ? String(m.year) : null),
+      poster: m.poster || null,
+      background: m.background || null,
+      imdbRating: m.imdbRating ? String(m.imdbRating) : null,
+      genres: Array.isArray(m.genres) ? m.genres : [],
+      description: m.description || null
+    })).filter(x => x.imdbId && x.imdbId.startsWith('tt'));
+    return { ok: true, status: 200, code: 'OK', data: { results, resolution: { source: 'cinemeta-direct' } } };
+  } catch (err) {
+    return { ok: false, status: 0, code: 'NETWORK_ERROR', error: err instanceof Error ? err.message : 'Cinemeta search failed.', data: null };
+  }
 }
 
 export async function fetchMediaDetail(id, mediaType = 'series') {
-  const cleanId = encodeURIComponent(String(id ?? '').trim());
-  const route = mediaType === 'movie'
-    ? `/api/cinemeta/movie/${cleanId}`
-    : `/api/cinemeta/series/${cleanId}`;
-  return desktopApiRequest({ method: 'GET', path: route, timeoutMs: 12000 });
+  const cleanId = String(id ?? '').trim();
+  const mt = mediaType === 'movie' ? 'movie' : 'series';
+  if (isTauriRuntime()) {
+    return invoke('cinemeta_detail', { id: cleanId, mediaType: mt });
+  }
+  try {
+    const res = await fetch(`https://v3-cinemeta.strem.io/meta/${mt}/${encodeURIComponent(cleanId)}.json`);
+    const json = await res.json();
+    const meta = json.meta;
+    if (!meta) return { ok: false, status: 404, code: 'NOT_FOUND', error: 'Title metadata not found.', data: null };
+    if (mt === 'movie') {
+      return { ok: true, status: 200, code: 'OK', data: { movie: { ...meta, id: cleanId, imdbId: cleanId, title: meta.name, synopsis: meta.description } } };
+    }
+    const episodes = {};
+    (meta.videos || []).forEach(v => {
+      const s = String(v.season ?? 1);
+      if (!episodes[s]) episodes[s] = [];
+      episodes[s].push({ season: v.season ?? 1, episode: v.episode, number: v.episode, title: v.name || v.title || `Episode ${v.episode}` });
+    });
+    return { ok: true, status: 200, code: 'OK', data: { series: { ...meta, id: cleanId, imdbId: cleanId, title: meta.name, synopsis: meta.description }, episodes } };
+  } catch (err) {
+    return { ok: false, status: 0, code: 'NETWORK_ERROR', error: err instanceof Error ? err.message : 'Cinemeta lookup failed.', data: null };
+  }
+}
+
+export async function checkTorrentioManifest(baseUrl = null) {
+  if (isTauriRuntime()) return invoke('torrentio_check_manifest', { baseUrl });
+  return { ok: false, baseUrl: baseUrl || 'https://torrentio.strem.fun', latencyMs: 0, error: 'Desktop runtime required.' };
+}
+
+export async function fetchTorrentioMovieSources({ movieId, preference, audioMode, filters }) {
+  if (isTauriRuntime()) {
+    return invoke('torrentio_movie_sources', { movieId, preference, audioMode, filters });
+  }
+  throw new Error('Native Torrentio adapter requires the SeasonFetch Desktop app.');
+}
+
+export async function fetchTorrentioSeasonSources({ seriesId, season, episodes, preference, audioMode, filters }) {
+  if (isTauriRuntime()) {
+    return invoke('torrentio_season_sources', { seriesId, season, episodes, preference, audioMode, filters });
+  }
+  throw new Error('Native Torrentio adapter requires the SeasonFetch Desktop app.');
+}
+
+export async function searchExternalSubtitles(query) {
+  if (isTauriRuntime()) return invoke('subtitles_search', { query });
+  return { ok: false, candidates: [], providersQueried: [], warnings: ['Desktop runtime required.'] };
+}
+
+export async function downloadExternalSubtitle(request) {
+  if (isTauriRuntime()) return invoke('subtitles_download', { request });
+  return { ok: false, error: 'Desktop runtime required.' };
 }
 
 export async function openExternalUrl(url) {
@@ -339,11 +403,10 @@ export async function getStreamingStatus() {
     integratedTorrentEngineActive: false,
     engineName: 'Direct HTTP/HTTPS & Local File Playback',
     localHttpOrigin: null,
-    stremioServiceReachable: false,
-    stremioServiceOrigin: 'http://127.0.0.1:11470',
     activeSession: null,
     cacheDir: null,
     cacheSizeBytes: 0,
+    cacheMaxBytes: 0,
     capabilities: ['Direct HTTP/HTTPS video streams', 'Styled ASS/SSA, SRT, WebVTT subtitles'],
     limitations: ['Embedded torrent streaming requires the SeasonFetch Tauri desktop runtime.']
   };

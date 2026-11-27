@@ -1,7 +1,7 @@
 use chrono::Utc;
 use seasonfetch_core::models::{
-    sanitize_settings, ActivityEntry, DesktopSettings, RecentlyViewedEntry, MAX_ACTIVITY_ENTRIES,
-    MAX_RECENTLY_VIEWED,
+    default_update_channel_for_version, sanitize_settings, ActivityEntry, DesktopSettings,
+    RecentlyViewedEntry, MAX_ACTIVITY_ENTRIES, MAX_RECENTLY_VIEWED,
 };
 use seasonfetch_core::player::{upsert_playback_progress, PlaybackProgressRecord};
 use serde_json::Value;
@@ -19,12 +19,21 @@ pub struct SettingsManager {
 }
 
 impl SettingsManager {
-    pub fn new(settings_path: PathBuf, progress_path: PathBuf, allow_localhost: bool) -> Self {
+    pub fn new(
+        settings_path: PathBuf,
+        progress_path: PathBuf,
+        allow_localhost: bool,
+        app_version: &str,
+    ) -> Self {
         let initial_settings = fs::read_to_string(&settings_path)
             .ok()
             .and_then(|raw| serde_json::from_str::<DesktopSettings>(&raw).ok())
             .map(|s| sanitize_settings(s, allow_localhost))
-            .unwrap_or_else(|| sanitize_settings(DesktopSettings::default(), allow_localhost));
+            .unwrap_or_else(|| {
+                let mut defaults = DesktopSettings::default();
+                defaults.update_channel = default_update_channel_for_version(app_version);
+                sanitize_settings(defaults, allow_localhost)
+            });
 
         let initial_progress: HashMap<String, PlaybackProgressRecord> =
             fs::read_to_string(&progress_path)

@@ -28,19 +28,19 @@ jobs:
       RELEASES_REPO: rightcodes1/SeasonFetch-Desktop-Releases
     steps:
       - name: Checkout private SeasonFetch-Desktop source
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
           cache: npm
 
       - name: Setup Rust stable toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
 
       - name: Cache Cargo dependencies
-        uses: swatinem/rust-cache@v2
+        uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: '. -> target'
 
@@ -117,10 +117,11 @@ jobs:
           cargo check -p seasonfetch-desktop
           npm test
 
-      - name: Fetch Windows libmpv-2.dll runtime for bundling
+      - name: Fetch and SHA-256 verify Windows libmpv-2.dll and libVLC runtimes for bundling
         shell: pwsh
         run: |
           .\scripts\fetch-libmpv.ps1
+          .\scripts\fetch-libvlc.ps1
 
       - name: Build Tauri 2 Windows NSIS installer and Ed25519 signature
         shell: pwsh
@@ -203,7 +204,7 @@ jobs:
           Get-Content (Join-Path $outDir "SHA256SUMS.txt")
 
       - name: Upload workflow build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: seasonfetch-tauri-windows-${{ steps.meta.outputs.tag }}
           path: release-tauri/*

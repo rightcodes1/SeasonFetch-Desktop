@@ -414,4 +414,385 @@ impl ApiBridge {
             }
         }
     }
+
+    /// Direct native Cinemeta search (free-text or IMDb ID) with local SWR caching.
+    /// Operates independently of the SeasonFetch website backend.
+    pub async fn search_cinemeta(
+        &self,
+        query: &str,
+        media_type: &str,
+        mode: &str,
+    ) -> ApiBridgeResponse {
+        let clean_q = query.trim();
+        let mt = if media_type == "movie" { "movie" } else { "series" };
+        if clean_q.len() < 2 {
+            return ApiBridgeResponse {
+                ok: false,
+                status: 400,
+                status_text: "Bad Request".to_string(),
+                code: "INVALID_QUERY".to_string(),
+                error: Some("Enter at least 2 characters or an IMDb ID (e.g. tt0903747).".to_string()),
+                data: None,
+            };
+        }
+
+        let cache_key = format!("cinemeta:search:{mt}:{mode}:{}", clean_q.to_ascii_lowercase());
+        if let Ok(mut cache) = self.meta_cache.lock() {
+            if let Some(hit) = cache.get(&cache_key) {
+                if !hit.stale {
+                    return ApiBridgeResponse {
+                        ok: true,
+                        status: 200,
+                        status_text: "OK (cached)".to_string(),
+                        code: "OK".to_string(),
+                        error: None,
+                        data: Some(hit.value),
+                    };
+                }
+            }
+        }
+
+        // Direct IMDb ID lookup (e.g. tt0877057)
+        let is_imdb_id = clean_q.starts_with("tt")
+            && clean_q.len() >= 7
+            && clean_q[2..].bytes().all(|b| b.is_ascii_digit());
+
+        if is_imdb_id {
+            let url = format!("{CINEMETA_ORIGIN}/meta/{mt}/{clean_q}.json");
+            match self.client.get(&url).timeout(Duration::from_secs(12)).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    if let Ok(json) = resp.json::<Value>().await {
+                        if let Some(meta) = json.get("meta") {
+                            if let Some(item) = map_cinemeta_search_item(meta, mt) {
+                                let payload = serde_json::json!({
+                                    "results": [item],
+                                    "resolution": { "source": "cinemeta-direct", "matchedBy": "imdb-id" }
+                                });
+                                if let Ok(mut cache) = self.meta_cache.lock() {
+                                    cache.set(cache_key, payload.clone());
+                                }
+                                return ApiBridgeResponse {
+                                    ok: true,
+                                    status: 200,
+                                    status_text: "OK".to_string(),
+                                    code: "OK".to_string(),
+                                    error: None,
+                                    data: Some(payload),
+                                };
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let encoded: String = url::form_urlencoded::byte_serialize(clean_q.as_bytes()).collect();
+        let url = format!("{CINEMETA_ORIGIN}/catalog/{mt}/top/search={encoded}.json");
+        let limit = if mode == "autocomplete" { 10 } else { 32 };
+
+        match self.client.get(&url).timeout(Duration::from_secs(12)).send().await {
+            Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
+                Ok(json) => {
+                    let metas = json
+                        .get("metas")
+                        .and_then(|m| m.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                    let results: Vec<Value> = metas
+                        .iter()
+                        .filter_map(|m| map_cinemeta_search_item(m, mt))
+                        .take(limit)
+                        .collect();
+                    let payload = serde_json::json!({
+                        "results": results,
+                        "resolution": { "source": "cinemeta-direct", "query": clean_q }
+                    });
+                    if let Ok(mut cache) = self.meta_cache.lock() {
+                        cache.set(cache_key, payload.clone());
+                    }
+                    ApiBridgeResponse {
+                        ok: true,
+                        status: 200,
+                        status_text: "OK".to_string(),
+                        code: "OK".to_string(),
+                        error: None,
+                        data: Some(payload),
+                    }
+                }
+                Err(err) => ApiBridgeResponse {
+                    ok: false,
+                    status: 502,
+                    status_text: "Bad Gateway".to_string(),
+                    code: "MALFORMED_RESPONSE".to_string(),
+                    error: Some(format!("Cinemeta returned invalid JSON: {err}")),
+                    data: None,
+                },
+            },
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                ApiBridgeResponse {
+                    ok: false,
+                    status,
+                    status_text: resp.status().canonical_reason().unwrap_or("").to_string(),
+                    code: format!("HTTP_{status}"),
+                    error: Some(format!("Cinemeta search failed with HTTP {status}.")),
+                    data: None,
+                }
+            }
+            Err(err) => ApiBridgeResponse {
+                ok: false,
+                status: 0,
+                status_text: String::new(),
+                code: if err.is_timeout() { "REQUEST_TIMEOUT" } else { "NETWORK_ERROR" }.to_string(),
+                error: Some(format!("Unable to reach Cinemeta directly: {err}")),
+                data: None,
+            },
+        }
+    }
+
+    /// Direct native Cinemeta metadata lookup for a movie or series (including full episode list).
+    pub async fn fetch_cinemeta_detail(&self, id: &str, media_type: &str) -> ApiBridgeResponse {
+        let clean_id = id.trim();
+        let mt = if media_type == "movie" { "movie" } else { "series" };
+        if !clean_id.starts_with("tt") || !clean_id[2..].bytes().all(|b| b.is_ascii_digit()) {
+            return ApiBridgeResponse {
+                ok: false,
+                status: 400,
+                status_text: "Bad Request".to_string(),
+                code: "INVALID_IMDB_ID".to_string(),
+                error: Some(format!("Invalid IMDb ID: {clean_id}")),
+                data: None,
+            };
+        }
+
+        let cache_key = format!("cinemeta:meta:{mt}:{clean_id}");
+        if let Ok(mut cache) = self.meta_cache.lock() {
+            if let Some(hit) = cache.get(&cache_key) {
+                if !hit.stale {
+                    return ApiBridgeResponse {
+                        ok: true,
+                        status: 200,
+                        status_text: "OK (cached)".to_string(),
+                        code: "OK".to_string(),
+                        error: None,
+                        data: Some(hit.value),
+                    };
+                }
+            }
+        }
+
+        let url = format!("{CINEMETA_ORIGIN}/meta/{mt}/{clean_id}.json");
+        match self.client.get(&url).timeout(Duration::from_secs(14)).send().await {
+            Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
+                Ok(json) => {
+                    let Some(meta) = json.get("meta") else {
+                        return ApiBridgeResponse {
+                            ok: false,
+                            status: 404,
+                            status_text: "Not Found".to_string(),
+                            code: "NOT_FOUND".to_string(),
+                            error: Some(format!("No Cinemeta metadata found for {clean_id}.")),
+                            data: None,
+                        };
+                    };
+
+                    let payload = if mt == "movie" {
+                        let mapped = map_cinemeta_detail_object(meta, "movie", clean_id);
+                        serde_json::json!({ "movie": mapped })
+                    } else {
+                        let mut episodes_by_season: std::collections::BTreeMap<u32, Vec<Value>> =
+                            std::collections::BTreeMap::new();
+                        if let Some(videos) = meta.get("videos").and_then(|v| v.as_array()) {
+                            for v in videos {
+                                let season = v
+                                    .get("season")
+                                    .and_then(|s| s.as_u64())
+                                    .map(|s| s as u32)
+                                    .unwrap_or(1);
+                                let ep_num = v
+                                    .get("episode")
+                                    .or_else(|| v.get("number"))
+                                    .and_then(|e| e.as_u64())
+                                    .map(|e| e as u32)
+                                    .unwrap_or(0);
+                                if ep_num == 0 {
+                                    continue;
+                                }
+                                let title = v
+                                    .get("name")
+                                    .or_else(|| v.get("title"))
+                                    .and_then(|t| t.as_str())
+                                    .map(str::trim)
+                                    .filter(|s| !s.is_empty())
+                                    .map(str::to_string)
+                                    .unwrap_or_else(|| format!("Episode {ep_num}"));
+                                let released = v.get("released").and_then(|r| r.as_str()).map(str::to_string);
+                                let overview = v.get("overview").and_then(|o| o.as_str()).map(str::to_string);
+                                let thumbnail = v.get("thumbnail").and_then(|t| t.as_str()).map(str::to_string);
+                                episodes_by_season.entry(season).or_default().push(serde_json::json!({
+                                    "season": season,
+                                    "episode": ep_num,
+                                    "number": ep_num,
+                                    "title": title,
+                                    "released": released,
+                                    "overview": overview,
+                                    "thumbnail": thumbnail
+                                }));
+                            }
+                        }
+                        for list in episodes_by_season.values_mut() {
+                            list.sort_by_key(|e| e.get("number").and_then(|n| n.as_u64()).unwrap_or(0));
+                        }
+                        let mut episodes_map = serde_json::Map::new();
+                        for (s, list) in &episodes_by_season {
+                            episodes_map.insert(s.to_string(), Value::Array(list.clone()));
+                        }
+                        let mut series_obj = map_cinemeta_detail_object(meta, "series", clean_id);
+                        if let Some(obj) = series_obj.as_object_mut() {
+                            obj.insert(
+                                "seasons".to_string(),
+                                Value::from(episodes_by_season.keys().filter(|s| **s > 0).count().max(1)),
+                            );
+                        }
+                        serde_json::json!({
+                            "series": series_obj,
+                            "episodes": Value::Object(episodes_map)
+                        })
+                    };
+
+                    if let Ok(mut cache) = self.meta_cache.lock() {
+                        cache.set(cache_key, payload.clone());
+                    }
+                    ApiBridgeResponse {
+                        ok: true,
+                        status: 200,
+                        status_text: "OK".to_string(),
+                        code: "OK".to_string(),
+                        error: None,
+                        data: Some(payload),
+                    }
+                }
+                Err(err) => ApiBridgeResponse {
+                    ok: false,
+                    status: 502,
+                    status_text: "Bad Gateway".to_string(),
+                    code: "MALFORMED_RESPONSE".to_string(),
+                    error: Some(format!("Cinemeta metadata returned invalid JSON: {err}")),
+                    data: None,
+                },
+            },
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                ApiBridgeResponse {
+                    ok: false,
+                    status,
+                    status_text: resp.status().canonical_reason().unwrap_or("").to_string(),
+                    code: format!("HTTP_{status}"),
+                    error: Some(format!("Cinemeta metadata lookup failed with HTTP {status}.")),
+                    data: None,
+                }
+            }
+            Err(err) => ApiBridgeResponse {
+                ok: false,
+                status: 0,
+                status_text: String::new(),
+                code: if err.is_timeout() { "REQUEST_TIMEOUT" } else { "NETWORK_ERROR" }.to_string(),
+                error: Some(format!("Unable to reach Cinemeta directly: {err}")),
+                data: None,
+            },
+        }
+    }
+}
+
+fn map_cinemeta_search_item(raw: &Value, fallback_type: &str) -> Option<Value> {
+    let id = raw
+        .get("imdb_id")
+        .or_else(|| raw.get("id"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| s.starts_with("tt"))?;
+    let title = raw
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    let media_type = raw
+        .get("type")
+        .and_then(|v| v.as_str())
+        .map(|t| if t == "movie" { "movie" } else { "series" })
+        .unwrap_or(fallback_type);
+    let year = raw
+        .get("releaseInfo")
+        .or_else(|| raw.get("year"))
+        .and_then(|v| v.as_str().map(str::to_string).or_else(|| v.as_u64().map(|n| n.to_string())));
+    let rating = raw
+        .get("imdbRating")
+        .and_then(|v| v.as_str().map(str::to_string).or_else(|| v.as_f64().map(|n| format!("{n:.1}"))));
+    let genres: Vec<String> = raw
+        .get("genres")
+        .or_else(|| raw.get("genre"))
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|g| g.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+
+    Some(serde_json::json!({
+        "id": id,
+        "imdbId": id,
+        "mediaType": media_type,
+        "type": media_type,
+        "title": title,
+        "name": title,
+        "year": year,
+        "releaseYear": year,
+        "poster": raw.get("poster").and_then(|v| v.as_str()),
+        "posterUrl": raw.get("poster").and_then(|v| v.as_str()),
+        "background": raw.get("background").and_then(|v| v.as_str()),
+        "logo": raw.get("logo").and_then(|v| v.as_str()),
+        "imdbRating": rating,
+        "rating": rating,
+        "genres": genres,
+        "description": raw.get("description").and_then(|v| v.as_str()),
+        "overview": raw.get("description").and_then(|v| v.as_str())
+    }))
+}
+
+fn map_cinemeta_detail_object(meta: &Value, media_type: &str, imdb_id: &str) -> Value {
+    let title = meta
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Untitled")
+        .trim();
+    let year = meta
+        .get("releaseInfo")
+        .or_else(|| meta.get("year"))
+        .and_then(|v| v.as_str().map(str::to_string).or_else(|| v.as_u64().map(|n| n.to_string())));
+    let rating = meta
+        .get("imdbRating")
+        .and_then(|v| v.as_str().map(str::to_string).or_else(|| v.as_f64().map(|n| format!("{n:.1}"))));
+    let description = meta.get("description").and_then(|v| v.as_str());
+    let genres: Vec<String> = meta
+        .get("genres")
+        .or_else(|| meta.get("genre"))
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|g| g.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+
+    serde_json::json!({
+        "id": imdb_id,
+        "imdbId": imdb_id,
+        "mediaType": media_type,
+        "title": title,
+        "year": year,
+        "imdbRating": rating,
+        "rating": rating,
+        "poster": meta.get("poster").and_then(|v| v.as_str()),
+        "background": meta.get("background").and_then(|v| v.as_str()),
+        "logo": meta.get("logo").and_then(|v| v.as_str()),
+        "runtime": meta.get("runtime").and_then(|v| v.as_str()),
+        "genres": genres,
+        "synopsis": description,
+        "overview": description,
+        "description": description
+    })
 }

@@ -325,10 +325,10 @@ export function TitleDetailView({
             <span>·</span>
             <span>{getResolutionSummaryCopy(providerMode, resolutionPreference)}</span>
             <span>·</span>
-            <span className={streamingStatus?.stremioServiceReachable ? 'sf-ok-text' : 'sf-muted-sm'}>
-              {streamingStatus?.stremioServiceReachable
-                ? 'Local Torrent Streaming Bridge Connected (127.0.0.1:11470)'
-                : 'Streaming Mode: Direct Streams / Local Files / External Magnet Handoff'}
+            <span className={streamingStatus?.integratedTorrentEngineActive ? 'sf-ok-text' : 'sf-muted-sm'}>
+              {streamingStatus?.integratedTorrentEngineActive
+                ? 'Built-in Streaming Engine Ready (Direct Torrentio + Embedded Player)'
+                : 'Local File & Direct Stream Mode'}
             </span>
           </div>
 
@@ -494,14 +494,15 @@ export function TitleDetailView({
                               className="sf-primary-btn sf-sm"
                               onClick={() => onPlayRelease(ep, { isMovie: false, nextEpisode })}
                             >
-                              <Play size={13} fill="currentColor" /> Play in SeasonFetch
+                              <Play size={13} fill="currentColor" /> Play
                             </button>
                             <button
                               type="button"
                               className="sf-secondary-btn sf-sm"
                               onClick={() => onOpenMagnet(ep.magnet, `${item.title} S${season}E${ep.number}`)}
+                              title="Explicitly download full video file via your system BitTorrent client"
                             >
-                              <Magnet size={13} /> Open Magnet Externally
+                              <Download size={13} /> Download
                             </button>
                             <button
                               type="button"
@@ -605,14 +606,15 @@ export function TitleDetailView({
                         className="sf-primary-btn sf-sm"
                         onClick={() => onPlayRelease(movieRelease, { isMovie: true })}
                       >
-                        <Play size={13} fill="currentColor" /> Play in SeasonFetch
+                        <Play size={13} fill="currentColor" /> Play
                       </button>
                       <button
                         type="button"
                         className="sf-secondary-btn sf-sm"
                         onClick={() => onOpenMagnet(movieRelease.magnet, item.title)}
+                        title="Explicitly download full movie file via your system BitTorrent client"
                       >
-                        <ExternalLink size={13} /> Open Magnet Externally
+                        <Download size={13} /> Download
                       </button>
                       <button
                         type="button"

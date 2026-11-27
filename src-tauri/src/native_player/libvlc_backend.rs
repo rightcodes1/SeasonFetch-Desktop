@@ -537,7 +537,7 @@ impl EmbeddedLibVlc {
             })
             .map_err(|e| format!("Failed to spawn libVLC thread: {e}"))?;
 
-        match ready_rx.recv_timeout(Duration::from_secs(10)) {
+        match ready_rx.recv_timeout(Duration::from_secs(25)) {
             Ok(Ok(())) => Ok(Self {
                 tx,
                 state,

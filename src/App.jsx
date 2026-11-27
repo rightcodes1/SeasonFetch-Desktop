@@ -3,6 +3,7 @@ import { normalizeRankingPreference } from '../shared/rankingPreferences.js';
 import {
   cancelUpdateDownload,
   checkForUpdates,
+  checkTorrentioManifest,
   clearDesktopHistory,
   clearLocalCache,
   clearStreamCache,
@@ -69,7 +70,6 @@ import { LibraryView } from './components/LibraryView.jsx';
 import { ActivityView } from './components/ActivityView.jsx';
 import { SettingsView } from './components/SettingsView.jsx';
 import { PlayerOverlay } from './components/PlayerOverlay.jsx';
-import { PlaybackModal } from './components/PlaybackModal.jsx';
 import { UpdateBanner } from './components/UpdateBanner.jsx';
 import { AuthModal } from './components/AuthModal.jsx';
 import { ContextMenu } from './components/ContextMenu.jsx';
@@ -146,7 +146,6 @@ export default function App() {
 
   // Player, modals, context menu, and feedback
   const [playerSession, setPlayerSession] = useState(null);
-  const [playbackModalResolution, setPlaybackModalResolution] = useState(null);
   const [contextMenu, setContextMenu] = useState(null);
   const [showAuthModal, setShowAuthModal] = useState(false);
   const [authContextNote, setAuthContextNote] = useState('');
@@ -838,9 +837,11 @@ export default function App() {
     }
 
     setPlayerSession({
+      sourceKind: 'localFile',
       mediaKey,
       title: picked.name,
       subtitle: 'Local media file',
+      releaseName: picked.name,
       streamUrl: picked.path,
       rawPath: picked.path,
       resumeSecs: existing?.positionSecs || 0
@@ -862,30 +863,32 @@ export default function App() {
       fileIdx: Number.isInteger(releaseItem.fileIdx) ? releaseItem.fileIdx : null
     });
 
-    if (!resolved?.playableInApp) {
-      setPlaybackModalResolution(resolved);
-      return;
-    }
-
     const mediaKey = isMovie
       ? `movie:${selectedItem?.imdbId}`
       : `series:${selectedItem?.imdbId}:${season}:${releaseItem.number}`;
     const existing = await getPlaybackProgress(mediaKey);
+    const hasTorrentTarget = Boolean(
+      resolved?.magnetUri || resolved?.infoHash || releaseItem.magnet || releaseItem.hash
+    );
 
-    if (resolved.kind === 'embeddedTorrent') {
+    // Clicking Play ALWAYS streams inside SeasonFetch via the embedded torrent engine
+    // (never ambushing the user with an external download-client popup).
+    if (resolved?.kind === 'embeddedTorrent' || (!resolved?.streamUrl && hasTorrentTarget)) {
       setPlayerSession({
+        sourceKind: 'embeddedTorrent',
         mediaKey,
         title: selectedItem?.title || releaseItem.title,
         subtitle: isMovie
           ? releaseItem.format || 'Embedded Torrent Stream'
           : `Season ${season} · Episode ${releaseItem.number} — ${releaseItem.title}`,
+        releaseName: releaseItem.format || releaseItem.title || label,
         streamUrl: null,
         rawPath: null,
-        magnetUri: resolved.magnetUri || releaseItem.magnet || null,
+        magnetUri: resolved?.magnetUri || releaseItem.magnet || null,
         torrentRequest: {
           title: label,
-          magnetUri: resolved.magnetUri || releaseItem.magnet || null,
-          infoHash: resolved.infoHash || releaseItem.hash || null,
+          magnetUri: resolved?.magnetUri || releaseItem.magnet || null,
+          infoHash: resolved?.infoHash || releaseItem.hash || null,
           fileIdx: Number.isInteger(releaseItem.fileIdx) ? releaseItem.fileIdx : null,
           season: isMovie ? null : Number(season) || null,
           episode: isMovie ? null : Number(releaseItem.number) || null,
@@ -906,8 +909,8 @@ export default function App() {
       return;
     }
 
-    if (!resolved.streamUrl) {
-      setPlaybackModalResolution(resolved);
+    if (!resolved?.streamUrl) {
+      showNotice(resolved?.reason || 'No playable media source was found for this release.');
       return;
     }
 
@@ -940,9 +943,11 @@ export default function App() {
     }
 
     setPlayerSession({
+      sourceKind: 'directHttp',
       mediaKey,
       title: selectedItem?.title || releaseItem.title,
       subtitle: isMovie ? releaseItem.format : `Season ${season} · Episode ${releaseItem.number} — ${releaseItem.title}`,
+      releaseName: releaseItem.format || releaseItem.title || label,
       streamUrl: resolved.streamUrl,
       rawPath: null,
       magnetUri: resolved.magnetUri || releaseItem.magnet || null,
@@ -1360,6 +1365,14 @@ export default function App() {
                   });
                   showToast(`External player set to ${picked.name}`);
                 }}
+                onCheckTorrentioAddon={async () => {
+                  const res = await checkTorrentioManifest(settings?.torrentioBaseUrl || null);
+                  if (res?.ok) {
+                    showToast(`${res.name || 'Torrentio'} v${res.version || ''} reachable (${res.latencyMs}ms)`);
+                  } else {
+                    showNotice(res?.error || 'Could not reach Torrentio addon manifest.');
+                  }
+                }}
                 onClearCache={async () => {
                   await clearLocalCache();
                   refreshAllCatalogs(true);
@@ -1397,6 +1410,7 @@ export default function App() {
         <PlayerOverlay
           session={playerSession}
           playerPrefs={settings?.player}
+          subtitlePrefs={settings?.subtitleProviders}
           playerBackend={playerBackend}
           onUpdatePlayerPrefs={patch => handleSettingsPatch({ player: { ...(settings?.player || {}), ...patch } }, { silent: true })}
           onOpenMagnet={handleOpenMagnet}
@@ -1409,22 +1423,6 @@ export default function App() {
             refreshPlayerStatus().catch(() => {});
           }}
           onToast={showToast}
-        />
-      )}
-
-      {playbackModalResolution && (
-        <PlaybackModal
-          resolution={playbackModalResolution}
-          streamingStatus={streamingStatus}
-          onOpenMagnet={handleOpenMagnet}
-          onCopyMagnet={handleCopyMagnet}
-          onPlayLocalFile={handleOpenLocalVideo}
-          onReprobeStreaming={async () => {
-            const st = await getStreamingStatus();
-            setStreamingStatus(st);
-            showToast(st.stremioServiceReachable ? 'Streaming bridge detected!' : 'Still not reachable on 127.0.0.1:11470');
-          }}
-          onClose={() => setPlaybackModalResolution(null)}
         />
       )}
 

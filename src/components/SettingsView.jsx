@@ -49,6 +49,7 @@ export function SettingsView({
   onRefreshCatalogs,
   onRefreshPlayerStatus,
   onPickExternalPlayer,
+  onCheckTorrentioAddon,
   onClearCache,
   onClearStreamCache,
   onClearHistory,
@@ -78,6 +79,8 @@ export function SettingsView({
 
   const player = settings?.player || {};
   const patchPlayer = patch => onPatchSettings({ player: { ...player, ...patch } });
+  const subProviders = settings?.subtitleProviders || {};
+  const patchSubProviders = patch => onPatchSettings({ subtitleProviders: { ...subProviders, ...patch } });
 
   return (
     <section className="sf-page sf-settings-page">
@@ -91,9 +94,9 @@ export function SettingsView({
         </div>
 
         <div className="sf-settings-status-strip">
-          <div className="sf-status-mini">
+          <div className="sf-status-mini" title="Account sync backend status (Discover, Search, Torrentio, Subtitles, and Streaming work natively even if offline)">
             <span className={`sf-dot ${health.status === 'online' ? 'is-online' : 'is-offline'}`} />
-            <span>Backend {health.status === 'online' ? `online (${health.latencyMs}ms)` : health.status}</span>
+            <span>Account Sync {health.status === 'online' ? `online (${health.latencyMs}ms)` : 'offline (local media active)'}</span>
           </div>
           <div className="sf-status-mini">
             <Shield size={13} />
@@ -300,6 +303,26 @@ export function SettingsView({
                   ))}
                 </select>
               </div>
+              <div className="sf-setting-row">
+                <div>
+                  <strong>Direct Torrentio Addon URL</strong>
+                  <p className="sf-muted-sm">Queried directly from SeasonFetch Desktop (HTTPS Stremio addon protocol, zero website dependency).</p>
+                </div>
+                <div className="sf-btn-row">
+                  <input
+                    className="sf-input sf-setting-control"
+                    type="url"
+                    value={settings?.torrentioBaseUrl || 'https://torrentio.strem.fun'}
+                    placeholder="https://torrentio.strem.fun"
+                    onChange={e => onPatchSettings({ torrentioBaseUrl: e.target.value })}
+                  />
+                  {onCheckTorrentioAddon && (
+                    <button type="button" className="sf-secondary-btn sf-sm" onClick={onCheckTorrentioAddon}>
+                      Test Addon
+                    </button>
+                  )}
+                </div>
+              </div>
             </div>
           )}
 
@@ -368,7 +391,7 @@ export function SettingsView({
                     Embedded libmpv (Primary)
                   </option>
                   <option value="embedded-libvlc" disabled={!playerBackend?.libvlcAvailable}>
-                    Embedded libVLC (System VLC)
+                    Embedded libVLC (Built-in Alternative)
                   </option>
                   <option value="external-player">
                     External Player (Custom .exe)
@@ -439,6 +462,78 @@ export function SettingsView({
                 </div>
               </div>
 
+              <div className="sf-setting-row">
+                <div className="sf-setting-copy">
+                  <strong>Preferred Subtitle Language</strong>
+                  <p className="sf-muted-sm">Used by direct OpenSubtitles, SubDL, and custom subtitle addon searches.</p>
+                </div>
+                <select
+                  className="sf-select sf-sm"
+                  value={subProviders.preferredLanguage || 'eng'}
+                  onChange={e => patchSubProviders({ preferredLanguage: e.target.value })}
+                >
+                  <option value="eng">English</option>
+                  <option value="ara">Arabic</option>
+                  <option value="spa">Spanish</option>
+                  <option value="fre">French</option>
+                  <option value="ger">German</option>
+                  <option value="por">Portuguese</option>
+                  <option value="jpn">Japanese</option>
+                </select>
+              </div>
+
+              <div className="sf-setting-row">
+                <div className="sf-setting-copy">
+                  <strong>Auto-Select External Subtitles</strong>
+                  <p className="sf-muted-sm">Automatically search and attach the top-ranked external subtitle when a video has no embedded subtitles.</p>
+                </div>
+                <input
+                  type="checkbox"
+                  checked={Boolean(subProviders.autoSelect ?? true)}
+                  onChange={e => patchSubProviders({ autoSelect: e.target.checked })}
+                />
+              </div>
+
+              <div className="sf-setting-row">
+                <div className="sf-setting-copy">
+                  <strong>Save Subtitles Alongside Local Videos</strong>
+                  <p className="sf-muted-sm">When watching local/downloaded videos, save downloaded subtitles next to the video file instead of the cache folder.</p>
+                </div>
+                <input
+                  type="checkbox"
+                  checked={Boolean(subProviders.saveAlongsideLocal)}
+                  onChange={e => patchSubProviders({ saveAlongsideLocal: e.target.checked })}
+                />
+              </div>
+
+              <div className="sf-setting-row">
+                <div className="sf-setting-copy">
+                  <strong>OpenSubtitles REST API Key (Optional)</strong>
+                  <p className="sf-muted-sm">OpenSubtitles v3 addon works without a key; add your personal key to also enable hash-matched REST API lookups.</p>
+                </div>
+                <input
+                  className="sf-input sf-setting-control"
+                  type="password"
+                  value={subProviders.opensubtitlesApiKey || ''}
+                  placeholder="Optional API key"
+                  onChange={e => patchSubProviders({ opensubtitlesApiKey: e.target.value })}
+                />
+              </div>
+
+              <div className="sf-setting-row">
+                <div className="sf-setting-copy">
+                  <strong>SubDL API Key (Optional)</strong>
+                  <p className="sf-muted-sm">Enables direct SubDL external subtitle searches from desktop.</p>
+                </div>
+                <input
+                  className="sf-input sf-setting-control"
+                  type="password"
+                  value={subProviders.subdlApiKey || ''}
+                  placeholder="Optional API key"
+                  onChange={e => patchSubProviders({ subdlApiKey: e.target.value })}
+                />
+              </div>
+
               <div className="sf-setting-group-label">STREAMING &amp; EXTERNAL</div>
 
               <div className="sf-setting-row">
@@ -446,10 +541,8 @@ export function SettingsView({
                   <strong>Embedded Torrent Streaming Engine</strong>
                   <p className="sf-muted-sm">
                     {streamingStatus?.integratedTorrentEngineActive
-                      ? `Active (${streamingStatus.engineName}) on ${streamingStatus.localHttpOrigin || '127.0.0.1'} — no external app required.`
-                      : streamingStatus?.stremioServiceReachable
-                        ? `External bridge connected on ${streamingStatus.stremioServiceOrigin}`
-                        : 'Not initialized on this runtime'}
+                      ? `Active (${streamingStatus.engineName}) on ${streamingStatus.localHttpOrigin || '127.0.0.1'} — token-protected loopback streaming, no external app required.`
+                      : 'Not initialized on this runtime'}
                   </p>
                 </div>
                 <div className="sf-btn-row">

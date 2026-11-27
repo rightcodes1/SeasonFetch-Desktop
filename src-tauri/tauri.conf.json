@@ -26,10 +26,16 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' https: data: asset: http://asset.localhost; media-src 'self' https: http://127.0.0.1:11470 asset: http://asset.localhost blob:; connect-src 'self' https://*.supabase.co http://127.0.0.1:11470 http://127.0.0.1:5175 ws://127.0.0.1:5175; object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' https: data: asset: http://asset.localhost; media-src 'self' https: http://127.0.0.1:* asset: http://asset.localhost blob:; connect-src 'self' https://*.supabase.co http://127.0.0.1:5175 ws://127.0.0.1:5175; object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
       "assetProtocol": {
         "enable": true,
-        "scope": ["**"]
+        "scope": [
+          "$APPDATA/**",
+          "$VIDEO/**",
+          "$DOWNLOAD/**",
+          "$DOCUMENT/**",
+          "$DESKTOP/**"
+        ]
       }
     }
   },
@@ -38,7 +44,8 @@
     "targets": ["nsis"],
     "createUpdaterArtifacts": true,
     "resources": [
-      "resources/libmpv-2.dll"
+      "resources/libmpv-2.dll",
+      "resources/vlc"
     ],
     "icon": [
       "icons/icon.ico",

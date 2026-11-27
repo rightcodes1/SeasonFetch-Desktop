@@ -488,8 +488,8 @@ impl EmbeddedLibMpv {
                     let _ = syms.set_opt_str(ctx, "ao", "null");
                 } else {
                     let _ = syms.set_opt_i64(ctx, "wid", wid_hwnd as i64);
-                    // Stremio v5 Windows VO chain: gpu-next (libplacebo D3D11 + HDR) -> gpu -> fallback
-                    let _ = syms.set_opt_str(ctx, "vo", "gpu-next,gpu,");
+                    // Windows VO chain: gpu-next (libplacebo D3D11 + HDR) -> gpu -> direct3d -> default fallback
+                    let _ = syms.set_opt_str(ctx, "vo", "gpu-next,gpu,direct3d,");
                     let _ = syms.set_opt_str(ctx, "gpu-context", "d3d11");
                     let _ = syms.set_opt_str(ctx, "d3d11-output-format", "auto");
                     let _ = syms.set_opt_str(ctx, "d3d11-output-csp", "auto");

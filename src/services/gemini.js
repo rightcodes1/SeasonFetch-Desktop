@@ -1,42 +1,19 @@
-import { desktopApiRequest } from './desktopApi.js';
-
+/**
+ * Gemini assistant endpoints previously lived on the website backend.
+ * Because SeasonFetch Desktop restricts the website backend strictly to
+ * account synchronization, this helper remains cleanly disabled until a
+ * user-configured direct local/BYOK AI integration is enabled.
+ */
 export const geminiApi = {
   async getStatus() {
-    const response = await desktopApiRequest({
-      method: 'GET',
-      path: '/api/gemini/status',
-      timeoutMs: 8000
-    });
-    if (!response.ok) {
-      return { configured: false, error: response.error };
-    }
-    return response.data || { configured: false };
+    return { configured: false };
   },
 
-  async searchAssist(query) {
-    const clean = String(query || '').trim();
-    const response = await desktopApiRequest({
-      method: 'POST',
-      path: '/api/gemini/search-assist',
-      body: { query: clean },
-      timeoutMs: 15_000
-    });
-    if (!response.ok) {
-      throw new Error(response.error || 'Gemini search assist is unavailable right now.');
-    }
-    return Array.isArray(response.data?.queries) ? response.data.queries : [];
+  async searchAssist() {
+    return [];
   },
 
-  async explainSource({ seriesTitle, season, episode, candidates }) {
-    const response = await desktopApiRequest({
-      method: 'POST',
-      path: '/api/gemini/explain-source',
-      body: { seriesTitle, season, episode, candidates },
-      timeoutMs: 20_000
-    });
-    if (!response.ok) {
-      throw new Error(response.error || 'Gemini explanation is unavailable right now.');
-    }
-    return response.data;
+  async explainSource() {
+    throw new Error('AI source explanation is disabled in independent desktop mode.');
   }
 };

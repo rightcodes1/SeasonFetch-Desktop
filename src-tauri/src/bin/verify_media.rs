@@ -89,7 +89,7 @@ fn main() {
     let dll = detect_libmpv_dll(None).expect("libmpv-2.dll not found");
     println!("libmpv DLL: {}", dll.display());
 
-    if let Some(vlc_dll) = detect_libvlc_dll() {
+    if let Some(vlc_dll) = detect_libvlc_dll(None) {
         println!(
             "Optional system libVLC DLL: {} ({:?})",
             vlc_dll.display(),
@@ -226,7 +226,7 @@ fn main() {
     drop(mpv);
 
     // Optional secondary engine verification: Embedded libVLC (if 64-bit system VLC is installed)
-    if let Some(vlc_dll) = detect_libvlc_dll() {
+    if let Some(vlc_dll) = detect_libvlc_dll(None) {
         println!("\n=== OPTIONAL ENGINE TEST: Embedded libVLC ({}) ===", vlc_dll.display());
         match seasonfetch_desktop_lib::native_player::libvlc_backend::EmbeddedLibVlc::spawn(
             vlc_dll,

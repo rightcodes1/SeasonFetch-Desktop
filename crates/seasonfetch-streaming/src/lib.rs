@@ -116,6 +116,9 @@ struct EngineInner {
     status: RwLock<StreamSessionStatus>,
     lifecycle_lock: Mutex<()>,
     http_shutdown: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    /// Captured Tokio runtime handle so sync callers (e.g. Tauri `.setup()` or sync commands)
+    /// can safely schedule background tasks without panicking on missing reactor context.
+    runtime: tokio::runtime::Handle,
     /// Opt-in flag for local-swarm benchmarks/tests ONLY (defaults to `false` so production
     /// always enforces SSRF rejection on loopback/private tracker URLs).
     allow_local_trackers: AtomicBool,
@@ -182,6 +185,7 @@ impl TorrentStreamingEngine {
             status: RwLock::new(StreamSessionStatus::idle()),
             lifecycle_lock: Mutex::new(()),
             http_shutdown: Mutex::new(Some(shutdown_tx)),
+            runtime: tokio::runtime::Handle::current(),
             allow_local_trackers: AtomicBool::new(false),
         });
 
@@ -205,7 +209,7 @@ impl TorrentStreamingEngine {
     /// and probes default trackers by RTT so the very first Play click starts fast.
     pub fn spawn_background_warmup(&self) {
         let engine = self.clone();
-        tokio::spawn(async move {
+        self.inner.runtime.spawn(async move {
             let cache_root = engine.inner.cache_root.clone();
             let cache_max = engine.cache_max_bytes();
             let allow_local = engine.inner.allow_local_trackers.load(Ordering::SeqCst);
@@ -256,7 +260,7 @@ impl TorrentStreamingEngine {
         let bytes = clamped * 1024 * 1024;
         self.inner.cache_max_bytes.store(bytes, Ordering::Relaxed);
         let lt = Arc::clone(&self.inner.libtorrent);
-        tokio::spawn(async move {
+        self.inner.runtime.spawn(async move {
             lt.update_cache_size(bytes).await;
         });
     }
@@ -2032,5 +2036,33 @@ mod tests {
         assert_eq!(hash, "0123456789abcdef0123456789abcdef01234567");
         assert!(trackers.iter().any(|t| t == "udp://custom.tracker:80/announce"));
         assert!(trackers.len() >= 8);
+    }
+
+    #[test]
+    fn sync_callers_outside_tokio_runtime_do_not_panic() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let tmp = std::env::temp_dir().join(format!(
+            "sf-stream-sync-caller-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let engine = rt
+            .block_on(TorrentStreamingEngine::start(tmp.clone(), 512))
+            .expect("engine start");
+        engine.set_upstream_base_url_for_testing("http://127.0.0.1:9".to_string());
+
+        // Mimic Tauri's synchronous `.setup()` main thread and sync commands (no Tokio context!)
+        let eng_clone = engine.clone();
+        std::thread::spawn(move || {
+            eng_clone.set_cache_max_mb(1024);
+            eng_clone.spawn_background_warmup();
+        })
+        .join()
+        .expect("calling set_cache_max_mb / spawn_background_warmup off-runtime must not panic");
+
+        rt.block_on(engine.shutdown());
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

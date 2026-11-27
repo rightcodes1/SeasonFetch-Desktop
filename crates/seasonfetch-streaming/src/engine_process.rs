@@ -19,6 +19,18 @@ pub const DEFAULT_UPSTREAM_ORIGIN: &str = "http://127.0.0.1:11470";
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+fn strip_windows_verbatim_prefix(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Some(s) = path.to_str() {
+            if let Some(stripped) = s.strip_prefix(r"\\?\") {
+                return PathBuf::from(stripped);
+            }
+        }
+    }
+    path
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct EngineStatsFileDto {
@@ -130,8 +142,9 @@ impl LibtorrentEngineClient {
     }
 
     pub fn set_binary_path(&self, path: PathBuf) {
+        let cleaned = strip_windows_verbatim_prefix(path);
         if let Ok(mut guard) = self.binary_path.write() {
-            *guard = Some(path);
+            *guard = Some(cleaned);
         }
     }
 

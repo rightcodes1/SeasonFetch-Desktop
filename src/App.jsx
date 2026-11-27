@@ -9,6 +9,11 @@ import {
   clearStreamCache,
   dismissUpdaterRecovery,
   downloadAvailableUpdate,
+  downloadsCancel,
+  downloadsList,
+  downloadsOpenFolder,
+  downloadsRemove,
+  downloadsStart,
   fetchBackendHealth,
   fetchDiscoverCatalog,
   fetchMediaDetail,
@@ -35,6 +40,7 @@ import {
   searchCatalog,
   sendDesktopNotification,
   subscribeDesktopNavigation,
+  subscribeDownloadsUpdated,
   subscribeUpdaterStatus,
   updateDesktopSettings
 } from './services/desktopApi.js';
@@ -67,6 +73,7 @@ import { DiscoverView } from './components/DiscoverView.jsx';
 import { SearchView } from './components/SearchView.jsx';
 import { TitleDetailView } from './components/TitleDetailView.jsx';
 import { LibraryView } from './components/LibraryView.jsx';
+import { DownloadsView } from './components/DownloadsView.jsx';
 import { ActivityView } from './components/ActivityView.jsx';
 import { SettingsView } from './components/SettingsView.jsx';
 import { PlayerOverlay } from './components/PlayerOverlay.jsx';
@@ -98,6 +105,7 @@ export default function App() {
   const [magnetHandler, setMagnetHandler] = useState(null);
   const [playerBackend, setPlayerBackend] = useState(null);
   const [streamingStatus, setStreamingStatus] = useState(null);
+  const [offlineDownloads, setOfflineDownloads] = useState([]);
   const [playbackProgress, setPlaybackProgress] = useState([]);
   const [health, setHealth] = useState({ status: 'checking', latencyMs: null, error: null });
   const [isOnline, setIsOnline] = useState(() => (typeof navigator !== 'undefined' ? navigator.onLine : true));
@@ -294,8 +302,9 @@ export default function App() {
       inspectMagnetHandler(),
       getPlayerBackendInfo(),
       getStreamingStatus(),
-      listPlaybackProgress()
-    ]).then(([info, loadedSettings, updaterState, geminiStatus, handlerInfo, pBackend, sStatus, progressList]) => {
+      listPlaybackProgress(),
+      downloadsList()
+    ]).then(([info, loadedSettings, updaterState, geminiStatus, handlerInfo, pBackend, sStatus, progressList, dlList]) => {
       if (!active) return;
       setAppInfo(info);
       setSettings(loadedSettings);
@@ -305,6 +314,7 @@ export default function App() {
       setPlayerBackend(pBackend);
       setStreamingStatus(sStatus);
       setPlaybackProgress(Array.isArray(progressList) ? progressList : []);
+      setOfflineDownloads(Array.isArray(dlList) ? dlList : []);
 
       if (loadedSettings?.defaultSearchMode) setMediaType(normalizeMediaType(loadedSettings.defaultSearchMode));
       if (loadedSettings?.rankingPreference) setRankingPreference(normalizeRankingPreference(loadedSettings.rankingPreference));
@@ -317,6 +327,9 @@ export default function App() {
 
     const unsubUpdater = subscribeUpdaterStatus(next => {
       setUpdater(prev => (typeof next === 'function' ? next(prev) : next));
+    });
+    const unsubDownloads = subscribeDownloadsUpdated(list => {
+      if (Array.isArray(list)) setOfflineDownloads(list);
     });
     const unsubNav = subscribeDesktopNavigation(payload => {
       if (payload?.tab) selectTab(payload.tab, { settingsSection: payload.section || 'general' });
@@ -403,6 +416,7 @@ export default function App() {
     return () => {
       active = false;
       unsubUpdater();
+      unsubDownloads();
       unsubNav();
       autocompleteCoordinator.invalidate();
       scanCoordinator.invalidate();
@@ -849,10 +863,86 @@ export default function App() {
     logActivity({ kind: 'playback', title: picked.name, subtitle: 'Local file playback' });
   }
 
+  async function handleStartOfflineDownload(releaseItem, { isMovie = false } = {}) {
+    const label = isMovie
+      ? selectedItem?.title || releaseItem.title
+      : `${selectedItem?.title || ''} · S${season}E${releaseItem.number} — ${releaseItem.title}`;
+    try {
+      await downloadsStart({
+        title: label,
+        magnetUri: releaseItem.magnet || null,
+        infoHash: releaseItem.hash || null,
+        fileIdx: Number.isInteger(releaseItem.fileIdx) ? releaseItem.fileIdx : null,
+        poster: selectedItem?.poster || null,
+        season: isMovie ? null : Number(season) || null,
+        episode: isMovie ? null : Number(releaseItem.number) || null,
+        trackers: []
+      });
+      showToast(`Saving "${label}" for offline playback`);
+      logActivity({ kind: 'download', title: label, subtitle: 'Started offline download' });
+    } catch (err) {
+      showNotice(typeof err === 'string' ? err : err?.message || 'Could not start offline download.');
+    }
+  }
+
+  async function handlePlayDownloadedEntry(entry) {
+    if (!entry?.localPath) return;
+    const mediaKey = `offline:${entry.id}`;
+    const existing = await getPlaybackProgress(mediaKey);
+    setPlayerSession({
+      sourceKind: 'downloaded',
+      mediaKey,
+      title: entry.title,
+      subtitle: 'Downloaded for offline playback',
+      releaseName: entry.fileName || entry.title,
+      streamUrl: entry.localPath,
+      rawPath: entry.localPath,
+      season: entry.season ?? null,
+      episode: entry.episode ?? null,
+      resumeSecs: existing?.positionSecs || 0
+    });
+    logActivity({ kind: 'playback', title: entry.title, subtitle: 'Offline local playback' });
+  }
+
   async function handlePlayRelease(releaseItem, { isMovie = false, nextEpisode = null } = {}) {
     const label = isMovie
       ? selectedItem?.title || releaseItem.title
       : `${selectedItem?.title || ''} · S${season}E${releaseItem.number} — ${releaseItem.title}`;
+
+    const mediaKey = isMovie
+      ? `movie:${selectedItem?.imdbId}`
+      : `series:${selectedItem?.imdbId}:${season}:${releaseItem.number}`;
+    const existing = await getPlaybackProgress(mediaKey);
+
+    // Play immediately from local disk if already downloaded for offline viewing
+    const completedOffline = offlineDownloads.find(
+      d =>
+        d.status === 'completed' &&
+        d.localPath &&
+        ((releaseItem.hash && d.infoHash?.toLowerCase() === releaseItem.hash.toLowerCase() && (d.fileIdx == null || releaseItem.fileIdx == null || d.fileIdx === releaseItem.fileIdx)) ||
+          (!isMovie && d.season === Number(season) && d.episode === Number(releaseItem.number) && d.title?.includes(selectedItem?.title || '')))
+    );
+    if (completedOffline) {
+      setPlayerSession({
+        sourceKind: 'downloaded',
+        mediaKey,
+        title: selectedItem?.title || releaseItem.title,
+        subtitle: isMovie
+          ? 'Downloaded for offline playback'
+          : `Season ${season} · Episode ${releaseItem.number} — ${releaseItem.title}`,
+        releaseName: completedOffline.fileName || releaseItem.format || releaseItem.title || label,
+        streamUrl: completedOffline.localPath,
+        rawPath: completedOffline.localPath,
+        imdbId: selectedItem?.imdbId,
+        mediaType: isMovie ? 'movie' : 'series',
+        season: isMovie ? null : season,
+        episode: isMovie ? null : releaseItem.number,
+        resumeSecs: existing?.positionSecs || 0,
+        nextEpisode
+      });
+      logActivity({ kind: 'playback', title: label, subtitle: 'Offline local playback' });
+      return;
+    }
 
     const resolved = await resolvePlaybackSource({
       title: label,
@@ -863,10 +953,6 @@ export default function App() {
       fileIdx: Number.isInteger(releaseItem.fileIdx) ? releaseItem.fileIdx : null
     });
 
-    const mediaKey = isMovie
-      ? `movie:${selectedItem?.imdbId}`
-      : `series:${selectedItem?.imdbId}:${season}:${releaseItem.number}`;
-    const existing = await getPlaybackProgress(mediaKey);
     const hasTorrentTarget = Boolean(
       resolved?.magnetUri || resolved?.infoHash || releaseItem.magnet || releaseItem.hash
     );
@@ -1079,6 +1165,8 @@ export default function App() {
           activeTab={isDetailOpen ? 'discover' : currentView.tab}
           compact={Boolean(settings?.compactNav)}
           libraryCount={library.counts.total}
+          downloadsCount={offlineDownloads.filter(d => d.status === 'completed' || d.status === 'downloading' || d.status === 'queued').length}
+          activeDownloadsCount={offlineDownloads.filter(d => d.status === 'downloading' || d.status === 'queued').length}
           hasUpdate={updater?.status === 'available' || updater?.status === 'downloaded' || updater?.recoveryRequired}
           appInfo={appInfo}
           onSelectTab={tab => selectTab(tab)}
@@ -1213,6 +1301,7 @@ export default function App() {
                 }}
                 onExplainGemini={handleExplainWithGemini}
                 onPlayRelease={handlePlayRelease}
+                onDownloadRelease={handleStartOfflineDownload}
                 onPlayLocalFile={handleOpenLocalVideo}
                 onOpenMagnet={handleOpenMagnet}
                 onCopyMagnet={handleCopyMagnet}
@@ -1226,6 +1315,7 @@ export default function App() {
                 onUpdateLibraryStatus={library.updateStatus}
                 onToggleLibraryFavorite={library.toggleFavorite}
                 onRemoveLibrary={library.removeItem}
+                offlineDownloads={offlineDownloads}
               />
             ) : currentView.tab === 'discover' ? (
               <DiscoverView
@@ -1314,6 +1404,25 @@ export default function App() {
                 onUpdateStatus={library.updateStatus}
                 onToggleFavorite={library.toggleFavorite}
                 onRemove={library.removeItem}
+              />
+            ) : currentView.tab === 'downloads' ? (
+              <DownloadsView
+                downloads={offlineDownloads}
+                onPlayDownload={handlePlayDownloadedEntry}
+                onCancelDownload={async id => {
+                  const next = await downloadsCancel(id);
+                  if (Array.isArray(next)) setOfflineDownloads(next);
+                  showToast('Download cancelled');
+                }}
+                onRemoveDownload={async (id, deleteFile) => {
+                  const next = await downloadsRemove(id, deleteFile);
+                  if (Array.isArray(next)) setOfflineDownloads(next);
+                  showToast('Removed download');
+                }}
+                onOpenFolder={async p => {
+                  const res = await downloadsOpenFolder(p);
+                  if (!res?.ok && res?.error) showNotice(res.error);
+                }}
               />
             ) : currentView.tab === 'activity' ? (
               <ActivityView
@@ -1412,8 +1521,38 @@ export default function App() {
           playerPrefs={settings?.player}
           subtitlePrefs={settings?.subtitleProviders}
           playerBackend={playerBackend}
+          offlineDownloadState={(() => {
+            const hash = playerSession?.torrentRequest?.infoHash?.toLowerCase();
+            if (!hash) return 'idle';
+            const match = offlineDownloads.find(
+              d =>
+                d.infoHash?.toLowerCase() === hash &&
+                (playerSession.torrentRequest.fileIdx == null || d.fileIdx == null || d.fileIdx === playerSession.torrentRequest.fileIdx)
+            );
+            if (!match) return 'idle';
+            if (match.status === 'completed') return 'completed';
+            if (match.status === 'queued' || match.status === 'downloading') return 'downloading';
+            return 'idle';
+          })()}
+          onStartOfflineDownload={async (sess, status) => {
+            if (!sess?.torrentRequest) return;
+            try {
+              await downloadsStart({
+                title: sess.torrentRequest.title || sess.title,
+                magnetUri: sess.torrentRequest.magnetUri || sess.magnetUri || null,
+                infoHash: status?.infoHash || sess.torrentRequest.infoHash || null,
+                fileIdx: status?.fileIdx ?? sess.torrentRequest.fileIdx ?? null,
+                poster: selectedItem?.poster || null,
+                season: sess.season ?? null,
+                episode: sess.episode ?? null,
+                trackers: sess.torrentRequest.trackers || []
+              });
+              showToast('Saving for offline playback in background');
+            } catch (err) {
+              showToast(typeof err === 'string' ? err : err?.message || 'Could not start offline download');
+            }
+          }}
           onUpdatePlayerPrefs={patch => handleSettingsPatch({ player: { ...(settings?.player || {}), ...patch } }, { silent: true })}
-          onOpenMagnet={handleOpenMagnet}
           onPlayNextEpisode={nextEp => {
             setPlayerSession(null);
             handlePlayRelease(nextEp, { isMovie: false });

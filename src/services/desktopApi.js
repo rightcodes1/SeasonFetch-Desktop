@@ -366,6 +366,11 @@ export async function getPlayerBackendInfo() {
   };
 }
 
+export async function nativePlayerPrewarm(engine = null) {
+  if (isTauriRuntime()) return invoke('native_player_prewarm', { engine });
+  return { ok: true, engine: 'webview' };
+}
+
 export async function nativePlayerLoad(request) {
   if (isTauriRuntime()) return invoke('native_player_load', { request });
   return { ok: false, engine: 'webview', error: 'Native embedded engine requires the Tauri desktop runtime.' };
@@ -430,6 +435,43 @@ export async function getTorrentStreamStatus() {
 export async function clearStreamCache() {
   if (isTauriRuntime()) return invoke('stream_clear_cache');
   return { ok: true, freedBytes: 0 };
+}
+
+// Offline Downloads (Shared Transfer Manager) APIs
+export async function downloadsStart(request) {
+  if (isTauriRuntime()) return invoke('downloads_start', { request });
+  throw new Error('Offline downloads require the SeasonFetch Desktop app.');
+}
+
+export async function downloadsList() {
+  if (isTauriRuntime()) return invoke('downloads_list');
+  return [];
+}
+
+export async function downloadsCancel(id) {
+  if (isTauriRuntime()) return invoke('downloads_cancel', { id });
+  return [];
+}
+
+export async function downloadsRemove(id, deleteFile = false) {
+  if (isTauriRuntime()) return invoke('downloads_remove', { id, deleteFile });
+  return [];
+}
+
+export async function downloadsOpenFolder(path = null) {
+  if (isTauriRuntime()) return invoke('downloads_open_folder', { path });
+  return { ok: false, error: 'Desktop runtime required.' };
+}
+
+export function subscribeDownloadsUpdated(callback) {
+  if (isTauriRuntime()) {
+    let unlisten = () => {};
+    listen('downloads-updated', event => callback(event.payload)).then(fn => {
+      unlisten = fn;
+    });
+    return () => unlisten();
+  }
+  return () => {};
 }
 
 export function subscribeStreamSessionStatus(callback) {

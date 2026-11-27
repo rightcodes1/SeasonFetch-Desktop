@@ -230,6 +230,136 @@ impl NativePlaybackManager {
             .unwrap_or_default()
     }
 
+    pub fn prewarm(
+        &self,
+        app: &AppHandle,
+        requested_engine: Option<&str>,
+        prefs: &PlayerPreferences,
+    ) -> NativeEngineActionResult {
+        let Ok(mut inner) = self.inner.lock() else {
+            return NativeEngineActionResult {
+                ok: false,
+                engine: "none".to_string(),
+                error: Some("Playback manager lock poisoned".to_string()),
+                state: None,
+            };
+        };
+
+        let requested = requested_engine
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(&prefs.preferred_engine);
+
+        let chosen = select_best_engine(
+            requested,
+            inner.libmpv_dll.is_some(),
+            inner.libvlc_dll.is_some(),
+        );
+
+        if chosen != "embedded-libmpv" && chosen != "embedded-libvlc" {
+            return NativeEngineActionResult {
+                ok: true,
+                engine: chosen.to_string(),
+                error: None,
+                state: None,
+            };
+        }
+
+        if inner
+            .backend
+            .as_ref()
+            .map(|b| b.engine_id() == chosen)
+            .unwrap_or(false)
+        {
+            return NativeEngineActionResult {
+                ok: true,
+                engine: chosen.to_string(),
+                error: None,
+                state: inner.backend.as_ref().map(|b| b.snapshot()),
+            };
+        }
+
+        #[cfg(windows)]
+        let wid_hwnd = {
+            let Some(win) = app.get_webview_window("main") else {
+                return NativeEngineActionResult {
+                    ok: false,
+                    engine: chosen.to_string(),
+                    error: Some("Main Tauri window is unavailable.".to_string()),
+                    state: None,
+                };
+            };
+            let Ok(h) = win.hwnd() else {
+                return NativeEngineActionResult {
+                    ok: false,
+                    engine: chosen.to_string(),
+                    error: Some("Failed to acquire Win32 HWND.".to_string()),
+                    state: None,
+                };
+            };
+            let parent_hwnd = h.0 as isize;
+            if parent_hwnd == 0 || unsafe { IsWindow(parent_hwnd as HWND) } == 0 {
+                return NativeEngineActionResult {
+                    ok: false,
+                    engine: chosen.to_string(),
+                    error: Some("Main window HWND is invalid.".to_string()),
+                    state: None,
+                };
+            }
+            parent_hwnd
+        };
+
+        #[cfg(not(windows))]
+        let wid_hwnd: isize = 0;
+
+        let emitter_app = app.clone();
+        let on_state: Arc<dyn Fn(NativePlayerState) + Send + Sync> = Arc::new(move |st| {
+            let _ = emitter_app.emit("native-player-state", &st);
+        });
+
+        if let Some(prev) = inner.backend.take() {
+            let _ = prev.stop();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                drop(prev);
+                let _ = done_tx.send(());
+            });
+            let _ = done_rx.recv_timeout(std::time::Duration::from_millis(1200));
+        }
+
+        let spawned: Result<Box<dyn NativePlayerBackend>, String> = match chosen {
+            "embedded-libmpv" => match inner.libmpv_dll.clone() {
+                Some(dll) => EmbeddedLibMpv::spawn(dll, wid_hwnd, false, on_state)
+                    .map(|m| Box::new(m) as Box<dyn NativePlayerBackend>),
+                None => Err("Bundled libmpv-2.dll was not found.".to_string()),
+            },
+            "embedded-libvlc" => match inner.libvlc_dll.clone() {
+                Some(dll) => EmbeddedLibVlc::spawn(dll, wid_hwnd, on_state)
+                    .map(|v| Box::new(v) as Box<dyn NativePlayerBackend>),
+                None => Err("Bundled libvlc.dll was not found.".to_string()),
+            },
+            _ => Err(format!("Unsupported native engine: {chosen}")),
+        };
+
+        match spawned {
+            Ok(backend) => {
+                let snap = backend.snapshot();
+                inner.backend = Some(backend);
+                NativeEngineActionResult {
+                    ok: true,
+                    engine: chosen.to_string(),
+                    error: None,
+                    state: Some(snap),
+                }
+            }
+            Err(err) => NativeEngineActionResult {
+                ok: false,
+                engine: chosen.to_string(),
+                error: Some(err),
+                state: None,
+            },
+        }
+    }
+
     pub fn load(
         &self,
         app: &AppHandle,

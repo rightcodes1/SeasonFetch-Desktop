@@ -65,6 +65,17 @@ pub enum StreamSessionState {
     Error,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BundledSubtitleInfo {
+    pub file_idx: usize,
+    pub file_name: String,
+    pub format: String,
+    #[serde(default)]
+    pub language: Option<String>,
+    pub url: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct StreamSessionStatus {
@@ -79,6 +90,10 @@ pub struct StreamSessionStatus {
     pub file_name: Option<String>,
     #[serde(default)]
     pub stream_url: Option<String>,
+    #[serde(default)]
+    pub local_file_path: Option<String>,
+    #[serde(default)]
+    pub bundled_subtitles: Vec<BundledSubtitleInfo>,
     pub peers_connected: u64,
     pub peers_seen: u64,
     pub download_speed_bps: u64,
@@ -102,6 +117,8 @@ impl StreamSessionStatus {
             file_idx: None,
             file_name: None,
             stream_url: None,
+            local_file_path: None,
+            bundled_subtitles: Vec::new(),
             peers_connected: 0,
             peers_seen: 0,
             download_speed_bps: 0,

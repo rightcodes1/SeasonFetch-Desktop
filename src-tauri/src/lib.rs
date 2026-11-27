@@ -33,6 +33,7 @@ use seasonfetch_core::subtitles::{
 use seasonfetch_core::torrentio::{
     MovieTorrentioResponse, SeasonTorrentioResponse, TorrentioFilters,
 };
+use seasonfetch_streaming::transfer_manager::{OfflineDownloadEntry, StartOfflineDownloadRequest};
 use seasonfetch_streaming::{StartTorrentRequest, StatusCallback, TorrentStreamingEngine};
 use serde::Serialize;
 use serde_json::Value;
@@ -303,6 +304,13 @@ fn settings_update(patch: Value, app: AppHandle, state: State<'_, AppState>) -> 
             );
             if let Some(streaming) = &state.streaming {
                 streaming.set_cache_max_mb(updated.cache_max_mb as u64);
+                if !updated.downloads_dir.trim().is_empty() {
+                    let dir = std::path::PathBuf::from(updated.downloads_dir.trim());
+                    let engine_clone = streaming.clone();
+                    tauri::async_runtime::spawn(async move {
+                        engine_clone.set_downloads_dir(dir).await;
+                    });
+                }
             }
             serde_json::json!({ "ok": true, "settings": updated })
         }
@@ -344,6 +352,16 @@ fn get_playback_progress(media_key: String, state: State<'_, AppState>) -> Optio
 fn get_player_backend_info(state: State<'_, AppState>) -> PlaybackBackendInfo {
     let prefs = state.settings.get().player;
     get_playback_backend_info(&prefs, &state.native_player)
+}
+
+#[tauri::command]
+fn native_player_prewarm(
+    engine: Option<String>,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> NativeEngineActionResult {
+    let prefs = state.settings.get().player;
+    state.native_player.prewarm(&app, engine.as_deref(), &prefs)
 }
 
 #[tauri::command]
@@ -477,6 +495,92 @@ async fn stream_clear_cache(state: State<'_, AppState>) -> Result<Value, String>
     } else {
         Ok(serde_json::json!({ "ok": true, "freedBytes": 0 }))
     }
+}
+
+#[tauri::command]
+async fn downloads_start(
+    request: StartOfflineDownloadRequest,
+    state: State<'_, AppState>,
+) -> Result<OfflineDownloadEntry, String> {
+    let Some(engine) = state.streaming.clone() else {
+        return Err("Offline download engine is not available.".to_string());
+    };
+    state.logger.info(
+        "downloads",
+        &format!(
+            "Starting shared offline download for '{}' (fileIdx={:?})",
+            request.title, request.file_idx
+        ),
+    );
+    engine.start_offline_download(request).await
+}
+
+#[tauri::command]
+async fn downloads_list(state: State<'_, AppState>) -> Result<Vec<OfflineDownloadEntry>, String> {
+    if let Some(engine) = &state.streaming {
+        Ok(engine.list_offline_downloads().await)
+    } else {
+        Ok(Vec::new())
+    }
+}
+
+#[tauri::command]
+async fn downloads_cancel(
+    id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<OfflineDownloadEntry>, String> {
+    let Some(engine) = &state.streaming else {
+        return Ok(Vec::new());
+    };
+    engine.cancel_offline_download(&id).await
+}
+
+#[tauri::command]
+async fn downloads_remove(
+    id: String,
+    delete_file: Option<bool>,
+    state: State<'_, AppState>,
+) -> Result<Vec<OfflineDownloadEntry>, String> {
+    let Some(engine) = &state.streaming else {
+        return Ok(Vec::new());
+    };
+    engine
+        .remove_offline_download(&id, delete_file.unwrap_or(false))
+        .await
+}
+
+#[tauri::command]
+async fn downloads_open_folder(
+    path: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<Value, String> {
+    let target_dir = if let Some(raw) = path.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let p = std::path::PathBuf::from(raw);
+        if p.is_file() {
+            p.parent().unwrap_or(&p).to_path_buf()
+        } else {
+            p
+        }
+    } else if let Some(engine) = &state.streaming {
+        engine.downloads_dir().await
+    } else {
+        return Err("Downloads folder is not available.".to_string());
+    };
+
+    let _ = fs::create_dir_all(&target_dir);
+
+    #[cfg(windows)]
+    {
+        std::process::Command::new("explorer.exe")
+            .arg(&target_dir)
+            .spawn()
+            .map_err(|e| format!("Failed to open downloads folder: {e}"))?;
+    }
+
+    Ok(serde_json::json!({
+        "ok": true,
+        "path": target_dir.to_string_lossy()
+    }))
 }
 
 #[tauri::command]
@@ -694,6 +798,31 @@ fn updater_dismiss_recovery(app: AppHandle, state: State<'_, AppState>) -> Updat
     state.updater.dismiss_recovery(&app)
 }
 
+fn resolve_bundled_stream_engine(resource_dir: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
+    let exe_name = if cfg!(windows) {
+        "stream-engine.exe"
+    } else {
+        "stream-engine"
+    };
+
+    let mut candidates = Vec::new();
+    if let Some(res) = resource_dir {
+        candidates.push(res.join("resources").join(exe_name));
+        candidates.push(res.join(exe_name));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("resources").join(exe_name));
+            candidates.push(dir.join(exe_name));
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join("src-tauri").join("resources").join(exe_name));
+        candidates.push(cwd.join("resources").join(exe_name));
+    }
+    candidates.into_iter().find(|p| p.is_file())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -742,7 +871,7 @@ pub fn run() {
             );
 
             let resource_dir = app.path().resource_dir().ok();
-            let native_player = NativePlaybackManager::new(resource_dir);
+            let native_player = NativePlaybackManager::new(resource_dir.clone());
             let (mpv_dll, mpv_ver, vlc_dll, vlc_ver) = native_player.detected_info();
             logger.info(
                 "player",
@@ -755,24 +884,55 @@ pub fn run() {
                 ),
             );
 
+            let stream_engine_exe = resolve_bundled_stream_engine(resource_dir.as_deref());
+            logger.info(
+                "streaming",
+                &format!("Bundled libtorrent 2.1.1 engine path: {:?}", stream_engine_exe),
+            );
+
             let streaming_cache_dir = app_data_dir.join("stream-cache");
-            let streaming = match tauri::async_runtime::block_on(TorrentStreamingEngine::start(
-                streaming_cache_dir.clone(),
-                initial_settings.cache_max_mb as u64,
-            )) {
+            let downloads_meta_path = app_data_dir.join("downloads.json");
+            let downloads_dir = if !initial_settings.downloads_dir.trim().is_empty() {
+                std::path::PathBuf::from(initial_settings.downloads_dir.trim())
+            } else {
+                app.path()
+                    .download_dir()
+                    .map(|d| d.join("SeasonFetch"))
+                    .unwrap_or_else(|_| app_data_dir.join("downloads"))
+            };
+            let streaming = match tauri::async_runtime::block_on(
+                TorrentStreamingEngine::start_with_downloads(
+                    streaming_cache_dir.clone(),
+                    initial_settings.cache_max_mb as u64,
+                    downloads_dir.clone(),
+                    downloads_meta_path,
+                ),
+            ) {
                 Ok(engine) => {
+                    if let Some(exe_path) = stream_engine_exe {
+                        engine.set_engine_binary_path(exe_path);
+                    }
                     let stream_logger = logger.clone();
                     let _ = tauri::async_runtime::block_on(engine.set_log_callback(Arc::new(
                         move |msg: &str| {
                             stream_logger.info("streaming", msg);
                         },
                     )));
+                    let dl_app = app.handle().clone();
+                    let _ = tauri::async_runtime::block_on(engine.set_downloads_callback(
+                        Arc::new(move |list: Vec<OfflineDownloadEntry>| {
+                            let _ = dl_app.emit("downloads-updated", &list);
+                        }),
+                    ));
+                    // Warm up libtorrent 2.1.1 engine & rank trackers in background at app startup
+                    engine.spawn_background_warmup();
                     logger.info(
                         "streaming",
                         &format!(
-                            "Embedded torrent streaming engine ready on {} (cache: {})",
+                            "Embedded streaming engine ready on {} (cache: {}, downloads: {})",
                             engine.local_origin(),
-                            streaming_cache_dir.display()
+                            streaming_cache_dir.display(),
+                            downloads_dir.display()
                         ),
                     );
                     Some(engine)
@@ -1122,6 +1282,7 @@ pub fn run() {
             list_playback_progress,
             get_playback_progress,
             get_player_backend_info,
+            native_player_prewarm,
             native_player_load,
             native_player_stop,
             native_player_command,
@@ -1132,6 +1293,11 @@ pub fn run() {
             stream_stop_session,
             stream_get_status,
             stream_clear_cache,
+            downloads_start,
+            downloads_list,
+            downloads_cancel,
+            downloads_remove,
+            downloads_open_folder,
             launch_mpv,
             launch_custom_external_player,
             pick_external_player_exe,

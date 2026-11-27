@@ -2339,6 +2339,111 @@ html.sf-native-video-active .sf-workspace {
   box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5);
 }
 
+.sf-cinema-loading {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 28px 36px;
+  text-align: center;
+  color: #f3f4f8;
+}
+
+.sf-cinema-loading strong {
+  font: 600 17px 'Space Grotesk', sans-serif;
+  letter-spacing: -0.01em;
+}
+
+.sf-cinema-loading span {
+  font-size: 13px;
+  color: rgba(212, 217, 232, 0.78);
+  max-width: 460px;
+}
+
+.sf-buffering-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 14px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(12, 14, 20, 0.78);
+  color: #eef0f6;
+  font-size: 12px;
+  font-weight: 500;
+  backdrop-filter: blur(8px);
+}
+
+/* Downloads View */
+.sf-downloads-sections {
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+}
+
+.sf-downloads-group {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.sf-group-title {
+  margin: 0;
+  font: 600 14px 'Space Grotesk', sans-serif;
+  color: var(--text-secondary);
+}
+
+.sf-downloads-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.sf-download-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px 18px;
+}
+
+.sf-download-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.sf-download-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.sf-download-meta {
+  display: flex;
+  gap: 14px;
+  font: 500 12px 'DM Mono', monospace;
+  color: var(--text-secondary);
+}
+
+.sf-download-progress-track {
+  height: 5px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+
+.sf-download-progress-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #7c5cff, #38bdf8);
+  transition: width 0.35s ease;
+}
+
 .error-boundary-screen {
   min-height: 100vh;
   display: grid;

@@ -209,7 +209,7 @@ pub async fn get_streaming_engine_status(
         );
         return StreamingEngineStatus {
             integrated_torrent_engine_active: true,
-            engine_name: "SeasonFetch Embedded Torrent Engine (librqbit)".to_string(),
+            engine_name: "SeasonFetch Streaming Engine (libtorrent 2.1.1)".to_string(),
             local_http_origin: Some(engine.local_origin().to_string()),
             active_session: if has_active {
                 Some(active_session)
@@ -220,9 +220,9 @@ pub async fn get_streaming_engine_status(
             cache_size_bytes: cache_size,
             cache_max_bytes: engine.cache_max_bytes(),
             capabilities: vec![
-                "Built-in BitTorrent magnet streaming (DHT + trackers + metadata resolution)".to_string(),
+                "Built-in libtorrent-rasterbar 2.1.1 BitTorrent engine (time-critical piece deadlines, DHT/PEX/LSD, MKV Cues / MP4 moov pinning)".to_string(),
                 "Token-protected loopback HTTP Range (206) streaming & seeking without downloading full file".to_string(),
-                "Automatic episode file selection & parallel head+tail prewarm".to_string(),
+                "Shared playback + background offline download transfers with instant local replay".to_string(),
                 "Direct embedded libmpv & libVLC playback (MKV, HEVC, AV1, AC3/DTS, styled ASS/SSA)".to_string(),
                 "Active cache-budget enforcement and automatic teardown cleanup on close".to_string(),
             ],

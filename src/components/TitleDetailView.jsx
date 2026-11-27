@@ -93,6 +93,7 @@ export function TitleDetailView({
   onRestoreMovieRelease,
   onExplainGemini,
   onPlayRelease,
+  onDownloadRelease,
   onPlayLocalFile,
   onOpenMagnet,
   onCopyMagnet,
@@ -102,7 +103,8 @@ export function TitleDetailView({
   onSaveLibrary,
   onUpdateLibraryStatus,
   onToggleLibraryFavorite,
-  onRemoveLibrary
+  onRemoveLibrary,
+  offlineDownloads = []
 }) {
   const seasonMagnets = useMemo(
     () => (episodes || []).filter(ep => ep.magnet).map(ep => ep.magnet),
@@ -499,10 +501,22 @@ export function TitleDetailView({
                             <button
                               type="button"
                               className="sf-secondary-btn sf-sm"
-                              onClick={() => onOpenMagnet(ep.magnet, `${item.title} S${season}E${ep.number}`)}
-                              title="Explicitly download full video file via your system BitTorrent client"
+                              onClick={() =>
+                                onDownloadRelease
+                                  ? onDownloadRelease(ep, { isMovie: false })
+                                  : onOpenMagnet(ep.magnet, `${item.title} S${season}E${ep.number}`)
+                              }
+                              title="Download this episode for offline viewing inside SeasonFetch"
                             >
-                              <Download size={13} /> Download
+                              <Download size={13} />{' '}
+                              {offlineDownloads.some(
+                                d =>
+                                  d.status === 'completed' &&
+                                  ((ep.hash && d.infoHash?.toLowerCase() === ep.hash.toLowerCase()) ||
+                                    (d.season === season && d.episode === ep.number && d.title?.includes(item.title)))
+                              )
+                                ? 'Downloaded'
+                                : 'Download'}
                             </button>
                             <button
                               type="button"
@@ -510,6 +524,14 @@ export function TitleDetailView({
                               onClick={() => onCopyMagnet(ep.magnet, `Copied S${season}E${ep.number} magnet`)}
                             >
                               <Copy size={13} /> Copy Magnet
+                            </button>
+                            <button
+                              type="button"
+                              className="sf-ghost-btn sf-sm"
+                              onClick={() => onOpenMagnet(ep.magnet, `${item.title} S${season}E${ep.number}`)}
+                              title="Open magnet link in an external BitTorrent client"
+                            >
+                              <ExternalLink size={13} /> External Client
                             </button>
                           </>
                         )}
@@ -611,10 +633,22 @@ export function TitleDetailView({
                       <button
                         type="button"
                         className="sf-secondary-btn sf-sm"
-                        onClick={() => onOpenMagnet(movieRelease.magnet, item.title)}
-                        title="Explicitly download full movie file via your system BitTorrent client"
+                        onClick={() =>
+                          onDownloadRelease
+                            ? onDownloadRelease(movieRelease, { isMovie: true })
+                            : onOpenMagnet(movieRelease.magnet, item.title)
+                        }
+                        title="Download this movie for offline viewing inside SeasonFetch"
                       >
-                        <Download size={13} /> Download
+                        <Download size={13} />{' '}
+                        {offlineDownloads.some(
+                          d =>
+                            d.status === 'completed' &&
+                            movieRelease.hash &&
+                            d.infoHash?.toLowerCase() === movieRelease.hash.toLowerCase()
+                        )
+                          ? 'Downloaded'
+                          : 'Download'}
                       </button>
                       <button
                         type="button"
@@ -622,6 +656,14 @@ export function TitleDetailView({
                         onClick={() => onCopyMagnet(movieRelease.magnet, 'Movie magnet copied')}
                       >
                         <Copy size={13} /> Copy Magnet
+                      </button>
+                      <button
+                        type="button"
+                        className="sf-ghost-btn sf-sm"
+                        onClick={() => onOpenMagnet(movieRelease.magnet, item.title)}
+                        title="Open magnet link in an external BitTorrent client"
+                      >
+                        <ExternalLink size={13} /> External Client
                       </button>
                     </>
                   )}

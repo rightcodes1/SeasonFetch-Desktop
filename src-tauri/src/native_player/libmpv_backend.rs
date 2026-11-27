@@ -465,13 +465,16 @@ impl EmbeddedLibMpv {
                 let _ = syms.set_opt_str(ctx, "cache", "yes");
                 let _ = syms.set_opt_str(ctx, "cache-pause", "yes");
                 let _ = syms.set_opt_str(ctx, "cache-pause-initial", "yes");
-                let _ = syms.set_opt_str(ctx, "cache-pause-wait", "0.5");
-                let _ = syms.set_opt_str(ctx, "network-timeout", "60");
-                let _ = syms.set_opt_str(ctx, "demuxer-max-bytes", "150MiB");
-                let _ = syms.set_opt_str(ctx, "demuxer-readahead-secs", "15");
+                let _ = syms.set_opt_str(ctx, "cache-pause-wait", "0.25");
+                let _ = syms.set_opt_str(ctx, "network-timeout", "45");
+                let _ = syms.set_opt_str(ctx, "demuxer-max-bytes", "120MiB");
+                let _ = syms.set_opt_str(ctx, "demuxer-max-back-bytes", "40MiB");
+                let _ = syms.set_opt_str(ctx, "demuxer-readahead-secs", "20");
+                let _ = syms.set_opt_str(ctx, "stream-buffer-size", "1MiB");
+                let _ = syms.set_opt_str(ctx, "hr-seek", "no");
                 let _ = syms.set_opt_str(ctx, "demuxer-mkv-probe-start-time", "no");
-                let _ = syms.set_opt_str(ctx, "demuxer-lavf-probesize", "1048576");
-                let _ = syms.set_opt_str(ctx, "demuxer-lavf-analyzeduration", "1");
+                let _ = syms.set_opt_str(ctx, "demuxer-lavf-probesize", "524288");
+                let _ = syms.set_opt_str(ctx, "demuxer-lavf-analyzeduration", "0.5");
                 let _ = syms.set_opt_str(
                     ctx,
                     "demuxer-lavf-o",

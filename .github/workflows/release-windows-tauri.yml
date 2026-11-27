@@ -117,11 +117,12 @@ jobs:
           cargo check -p seasonfetch-desktop
           npm test
 
-      - name: Fetch and SHA-256 verify Windows libmpv-2.dll and libVLC runtimes for bundling
+      - name: Fetch and SHA-256 verify Windows libmpv-2.dll, libVLC, and stream-engine (libtorrent 2.1.1) runtimes for bundling
         shell: pwsh
         run: |
           .\scripts\fetch-libmpv.ps1
           .\scripts\fetch-libvlc.ps1
+          .\scripts\fetch-stream-engine.ps1
 
       - name: Build Tauri 2 Windows NSIS installer and Ed25519 signature
         shell: pwsh

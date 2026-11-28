@@ -1,7 +1,7 @@
 {
   "name": "seasonfetch-desktop",
   "productName": "SeasonFetch",
-  "version": "0.1.1-beta.10",
+  "version": "0.1.1-beta.11",
   "author": "SeasonFetch",
   "description": "Dedicated Windows desktop client for SeasonFetch.",
   "private": true,

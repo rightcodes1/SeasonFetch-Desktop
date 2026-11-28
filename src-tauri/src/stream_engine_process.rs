@@ -200,7 +200,7 @@ fn spawn_engine_process(spec: &EngineProcessSpec) -> io::Result<WindowsEngineChi
     let current_directory = spec
         .current_dir
         .as_deref()
-        .map(nul_terminated)
+        .map(|path| nul_terminated(path.as_os_str()))
         .transpose()?;
     let environment = build_environment_block(&spec.environment)?;
 

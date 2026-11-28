@@ -75,9 +75,17 @@ pub struct StartOfflineDownloadRequest {
 }
 
 /// Active managed `libtorrent` transfer shared by playback and/or offline download consumers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TorrentSessionOwnership {
+    SeasonFetch,
+    Borrowed,
+}
+
 pub(crate) struct ManagedTransfer {
     pub info_hash: String,
     pub files: Vec<(usize, String, u64)>,
+    /// Whether SeasonFetch can prove it created this session. Borrowed sessions are never removed.
+    pub session_ownership: TorrentSessionOwnership,
     pub playback_file_idx: Option<usize>,
     /// Active offline download ID -> target `file_idx` inside this torrent.
     pub offline_downloads: HashMap<String, usize>,
@@ -252,7 +260,9 @@ impl DownloadCatalog {
             }
             if let Some(h) = info_hash {
                 if entry.info_hash.eq_ignore_ascii_case(h)
-                    && (file_idx.is_none() || entry.file_idx.is_none() || entry.file_idx == file_idx)
+                    && (file_idx.is_none()
+                        || entry.file_idx.is_none()
+                        || entry.file_idx == file_idx)
                     && (season.is_none() || entry.season == season)
                     && (episode.is_none() || entry.episode == episode)
                 {

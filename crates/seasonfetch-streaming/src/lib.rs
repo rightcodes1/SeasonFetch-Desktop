@@ -17,12 +17,13 @@ pub mod subtitles;
 pub mod tracker_prober;
 pub mod transfer_manager;
 
-use crate::engine_process::{EngineStatsDto, LibtorrentEngineClient};
+use crate::engine_process::{EngineProcessSpawner, EngineStatsDto, LibtorrentEngineClient};
 use crate::subtitles::{discover_torrent_subtitles, DiscoveredTorrentSubtitle};
 use crate::tracker_prober::{TrackerProber, DEFAULT_TRACKERS};
 use crate::transfer_manager::{
     sanitize_download_filename, utc_now_rfc3339, ActiveDownloadWorker, DownloadCatalog,
     ManagedTransfer, OfflineDownloadEntry, OfflineDownloadStatus, StartOfflineDownloadRequest,
+    TorrentSessionOwnership,
 };
 use futures_util::StreamExt;
 use seasonfetch_core::streaming::{
@@ -107,6 +108,8 @@ struct EngineInner {
     downloads_cb: RwLock<Option<DownloadsCallback>>,
     /// Shared active `libtorrent` transfers keyed by lowercase `info_hash`.
     transfers: RwLock<HashMap<String, ManagedTransfer>>,
+    /// Prevents concurrent local playback/download workers from racing lookup and creation.
+    transfer_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// Single active playback session (points into a shared `ManagedTransfer`).
     active_playback: RwLock<Option<ActivePlaybackSession>>,
     /// Persistent offline downloads catalog (`downloads.json`).
@@ -138,8 +141,13 @@ impl TorrentStreamingEngine {
             .parent()
             .unwrap_or(&cache_root)
             .join("downloads.json");
-        Self::start_with_downloads(cache_root, cache_max_mb, default_downloads, downloads_meta_path)
-            .await
+        Self::start_with_downloads(
+            cache_root,
+            cache_max_mb,
+            default_downloads,
+            downloads_meta_path,
+        )
+        .await
     }
 
     pub async fn start_with_downloads(
@@ -179,6 +187,7 @@ impl TorrentStreamingEngine {
             log_cb: RwLock::new(None),
             downloads_cb: RwLock::new(None),
             transfers: RwLock::new(HashMap::new()),
+            transfer_locks: Mutex::new(HashMap::new()),
             active_playback: RwLock::new(None),
             download_catalog: Mutex::new(download_catalog),
             download_workers: Mutex::new(HashMap::new()),
@@ -198,6 +207,12 @@ impl TorrentStreamingEngine {
     /// Configure the resolved path to the bundled `stream-engine.exe` (`libtorrent 2.1.1`).
     pub fn set_engine_binary_path(&self, path: PathBuf) {
         self.inner.libtorrent.set_binary_path(path);
+    }
+
+    /// Install a host-specific process launcher before engine warmup. On Windows the desktop
+    /// host supplies a launcher that creates the child inside a kill-on-close Job Object.
+    pub fn set_engine_process_spawner(&self, spawner: Arc<dyn EngineProcessSpawner>) {
+        self.inner.libtorrent.set_process_spawner(spawner);
     }
 
     /// Override the upstream `stream-server` origin (for unit/integration tests with a mock server).
@@ -222,7 +237,9 @@ impl TorrentStreamingEngine {
                 })
                 .await
             {
-                engine.log_event(&format!("Background libtorrent engine warmup warning: {err}"));
+                engine.log_event(&format!(
+                    "Background libtorrent engine warmup warning: {err}"
+                ));
             }
 
             let candidates: Vec<String> = DEFAULT_TRACKERS.iter().map(|s| s.to_string()).collect();
@@ -267,7 +284,9 @@ impl TorrentStreamingEngine {
 
     /// Enable loopback tracker URLs (and disable DHT/PEX/LSD/SSRF mitigation) for local-swarm tests.
     pub fn set_allow_local_trackers_for_testing(&self, allow: bool) {
-        self.inner.allow_local_trackers.store(allow, Ordering::SeqCst);
+        self.inner
+            .allow_local_trackers
+            .store(allow, Ordering::SeqCst);
     }
 
     pub async fn set_log_callback(&self, cb: LogCallback) {
@@ -286,7 +305,12 @@ impl TorrentStreamingEngine {
         }
     }
 
-    pub(crate) fn upstream_file_url(&self, info_hash: &str, file_idx: usize, download: bool) -> String {
+    pub(crate) fn upstream_file_url(
+        &self,
+        info_hash: &str,
+        file_idx: usize,
+        download: bool,
+    ) -> String {
         self.inner
             .libtorrent
             .upstream_file_url(info_hash, file_idx, download)
@@ -400,51 +424,169 @@ impl TorrentStreamingEngine {
         magnet_uri: &str,
         trackers: &[String],
         generation_check: Option<u64>,
+        cancel: Option<&CancellationToken>,
         on_progress: Option<(&str, &str, &Option<StatusCallback>)>,
     ) -> Result<(EngineStatsDto, Vec<(usize, String, u64)>), String> {
         let key = info_hash.to_ascii_lowercase();
+        let transfer_lock = {
+            let mut locks = self.inner.transfer_locks.lock().await;
+            locks
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let _transfer_guard = transfer_lock.lock().await;
 
-        // Fast path: reuse an already-live shared transfer with resolved file metadata
-        if let Some(cached_files) = {
+        let cancelled = || {
+            cancel.is_some_and(CancellationToken::is_cancelled)
+                || generation_check.is_some_and(|expected| {
+                    self.inner.start_generation.load(Ordering::SeqCst) != expected
+                })
+        };
+        if cancelled() {
+            return Err("Torrent acquisition was cancelled.".to_string());
+        }
+
+        let local = {
             let transfers = self.inner.transfers.read().await;
-            transfers
-                .get(&key)
-                .filter(|t| !t.files.is_empty())
-                .map(|t| t.files.clone())
-        } {
-            if let Ok(stats) = self.inner.libtorrent.get_engine_stats(&key).await {
-                let files = stats.file_tuples();
-                let resolved = if !files.is_empty() { files } else { cached_files };
-                self.log_event(&format!(
-                    "Reusing shared active libtorrent transfer for info_hash={key}"
-                ));
-                return Ok((stats, resolved));
+            transfers.get(&key).map(|transfer| {
+                (
+                    transfer.files.clone(),
+                    transfer.has_any_consumer(),
+                    transfer.session_ownership,
+                )
+            })
+        };
+
+        if let Some((cached_files, has_consumers, ownership)) = local.as_ref() {
+            match self.inner.libtorrent.lookup_engine_stats(&key).await {
+                Ok(Some(stats)) => {
+                    let files = stats.file_tuples();
+                    let resolved = if files.is_empty() {
+                        cached_files.clone()
+                    } else {
+                        files
+                    };
+                    if !resolved.is_empty() {
+                        self.log_event(&format!(
+                            "Reusing SeasonFetch transfer record for info_hash={key} (ownership={ownership:?})"
+                        ));
+                        return Ok((stats, resolved));
+                    }
+                }
+                Ok(None) if *has_consumers => {
+                    return Err(format!(
+                        "Torrent session {key} disappeared while SeasonFetch consumers were active."
+                    ));
+                }
+                Ok(None) => {
+                    self.inner.transfers.write().await.remove(&key);
+                    self.log_event(&format!(
+                        "Discarded stale local transfer record for absent info_hash={key}"
+                    ));
+                }
+                Err(err) => {
+                    return Err(format!(
+                        "Could not safely check existing torrent session {key}: {err}"
+                    ));
+                }
             }
         }
 
+        if cancelled() {
+            return Err("Torrent acquisition was cancelled.".to_string());
+        }
         self.ensure_libtorrent_ready().await?;
 
-        let mut stats = self
+        // Read-only global stats are essential here: upstream's per-hash stats route auto-creates
+        // missing torrents. Never interpret transport, HTTP, or parse failures as absence.
+        let (mut stats, session_ownership) = match self
             .inner
             .libtorrent
-            .create_torrent(magnet_uri, trackers)
-            .await?;
+            .lookup_engine_stats(&key)
+            .await
+        {
+            Ok(Some(stats)) => {
+                let ownership = self
+                    .inner
+                    .transfers
+                    .read()
+                    .await
+                    .get(&key)
+                    .map(|transfer| transfer.session_ownership)
+                    .unwrap_or(TorrentSessionOwnership::Borrowed);
+                (stats, ownership)
+            }
+            Ok(None) => match self
+                .inner
+                .libtorrent
+                .create_torrent(magnet_uri, trackers)
+                .await
+            {
+                // This process serialized same-hash lookup/create and observed the hash absent
+                // immediately before POST /create, so this successful create is SeasonFetch-owned.
+                // The pinned server has no atomic claim token; inter-process races remain a stated
+                // limitation and are reconciled conservatively when the create response is ambiguous.
+                Ok(stats) => (stats, TorrentSessionOwnership::SeasonFetch),
+                Err(create_err) => {
+                    // The request may have reached the server before its response failed, or a
+                    // concurrent external client may have won the create race. Reconcile only
+                    // through the read-only global endpoint and conservatively borrow the result.
+                    match self.inner.libtorrent.lookup_engine_stats(&key).await {
+                        Ok(Some(stats)) => {
+                            self.log_event(&format!(
+                                "Torrent create outcome was ambiguous for info_hash={key}; treating the session as borrowed"
+                            ));
+                            (stats, TorrentSessionOwnership::Borrowed)
+                        }
+                        Ok(None) => return Err(create_err),
+                        Err(check_err) => {
+                            return Err(format!(
+                                "Torrent creation failed ({create_err}); follow-up ownership check also failed ({check_err})."
+                            ));
+                        }
+                    }
+                }
+            },
+            Err(err) => {
+                return Err(format!(
+                    "Could not safely determine whether torrent session {key} exists: {err}"
+                ));
+            }
+        };
         let mut files = stats.file_tuples();
 
-        // If metadata hasn't resolved yet (common for cold magnets), poll /{infoHash}/stats.json
+        {
+            let mut transfers = self.inner.transfers.write().await;
+            let entry = transfers
+                .entry(key.clone())
+                .or_insert_with(|| ManagedTransfer {
+                    info_hash: key.clone(),
+                    files: files.clone(),
+                    session_ownership,
+                    playback_file_idx: None,
+                    offline_downloads: HashMap::new(),
+                });
+            entry.files = files.clone();
+            if entry.session_ownership == TorrentSessionOwnership::SeasonFetch
+                && session_ownership == TorrentSessionOwnership::Borrowed
+            {
+                // Never upgrade an uncertain/borrowed server session into an owned one.
+                entry.session_ownership = TorrentSessionOwnership::Borrowed;
+            }
+        }
+
         let started_at = Instant::now();
         let meta_timeout = Duration::from_secs(45);
         while files.is_empty() {
-            if let Some(expected_gen) = generation_check {
-                if self.inner.start_generation.load(Ordering::SeqCst) != expected_gen {
-                    self.inner.libtorrent.remove_torrent(&key).await;
-                    return Err(
-                        "Stream initialization cancelled by a newer playback request.".to_string(),
-                    );
-                }
+            if cancelled() {
+                self.maybe_cleanup_transfer(&key).await;
+                return Err(
+                    "Torrent acquisition was cancelled while waiting for metadata.".to_string(),
+                );
             }
             if started_at.elapsed() >= meta_timeout {
-                self.inner.libtorrent.remove_torrent(&key).await;
+                self.maybe_cleanup_transfer(&key).await;
                 return Err(
                     "Unable to reach media sources in time. Try again or pick another source."
                         .to_string(),
@@ -476,22 +618,43 @@ impl TorrentStreamingEngine {
                 self.publish_status(st, cb).await;
             }
 
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            if let Ok(polled) = self.inner.libtorrent.get_engine_stats(&key).await {
-                files = polled.file_tuples();
-                stats = polled;
+            if let Some(cancel) = cancel {
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        self.maybe_cleanup_transfer(&key).await;
+                        return Err("Torrent acquisition was cancelled while waiting for metadata.".to_string());
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(300)) => {}
+                }
+            } else {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+
+            match self.inner.libtorrent.lookup_engine_stats(&key).await {
+                Ok(Some(polled)) => {
+                    files = polled.file_tuples();
+                    stats = polled;
+                    if !files.is_empty() {
+                        if let Some(entry) = self.inner.transfers.write().await.get_mut(&key) {
+                            entry.files = files.clone();
+                        }
+                    }
+                }
+                Ok(None) => {
+                    self.maybe_cleanup_transfer(&key).await;
+                    return Err(format!(
+                        "Torrent session {key} disappeared while waiting for metadata."
+                    ));
+                }
+                Err(err) => self.log_event(&format!(
+                    "Temporary global stats lookup failure for info_hash={key}: {err}"
+                )),
             }
         }
 
-        {
-            let mut transfers = self.inner.transfers.write().await;
-            let entry = transfers.entry(key.clone()).or_insert_with(|| ManagedTransfer {
-                info_hash: key.clone(),
-                files: files.clone(),
-                playback_file_idx: None,
-                offline_downloads: HashMap::new(),
-            });
-            entry.files = files.clone();
+        if cancelled() {
+            self.maybe_cleanup_transfer(&key).await;
+            return Err("Torrent acquisition was cancelled after metadata resolution.".to_string());
         }
 
         Ok((stats, files))
@@ -514,11 +677,21 @@ impl TorrentStreamingEngine {
         };
 
         if let Some(transfer) = removed {
-            self.inner.libtorrent.remove_torrent(&transfer.info_hash).await;
-            self.log_event(&format!(
-                "Removed ephemeral libtorrent transfer for info_hash={} (no active consumers)",
-                transfer.info_hash
-            ));
+            if transfer.session_ownership == TorrentSessionOwnership::SeasonFetch {
+                self.inner
+                    .libtorrent
+                    .remove_torrent(&transfer.info_hash)
+                    .await;
+                self.log_event(&format!(
+                    "Removed SeasonFetch-owned libtorrent transfer for info_hash={} (no active consumers)",
+                    transfer.info_hash
+                ));
+            } else {
+                self.log_event(&format!(
+                    "Released borrowed libtorrent transfer record for info_hash={} without removing the external session",
+                    transfer.info_hash
+                ));
+            }
         }
     }
 
@@ -634,14 +807,21 @@ impl TorrentStreamingEngine {
                 &magnet_uri,
                 &trackers,
                 Some(my_gen),
+                None,
                 Some((&session_id, &request.title, &on_status)),
             )
             .await
         {
             Ok(res) => res,
             Err(err) => {
-                self.set_error_status(&session_id, &request.title, Some(&info_hash), &err, &on_status)
-                    .await;
+                self.set_error_status(
+                    &session_id,
+                    &request.title,
+                    Some(&info_hash),
+                    &err,
+                    &on_status,
+                )
+                .await;
                 return Err(err);
             }
         };
@@ -651,8 +831,14 @@ impl TorrentStreamingEngine {
         else {
             self.maybe_cleanup_transfer(&info_hash).await;
             let msg = "No playable video file was found in this source.".to_string();
-            self.set_error_status(&session_id, &request.title, Some(&info_hash), &msg, &on_status)
-                .await;
+            self.set_error_status(
+                &session_id,
+                &request.title,
+                Some(&info_hash),
+                &msg,
+                &on_status,
+            )
+            .await;
             return Err(msg);
         };
 
@@ -958,18 +1144,34 @@ impl TorrentStreamingEngine {
         cancel: CancellationToken,
     ) {
         let (_stats, files) = match self
-            .ensure_shared_transfer(&info_hash, &magnet_uri, &trackers, None, None)
+            .ensure_shared_transfer(
+                &info_hash,
+                &magnet_uri,
+                &trackers,
+                None,
+                Some(&cancel),
+                None,
+            )
             .await
         {
             Ok(res) => res,
             Err(err) => {
                 self.update_download_entry(&download_id, |e| {
-                    e.status = OfflineDownloadStatus::Failed;
-                    e.error = Some(err);
+                    if cancel.is_cancelled() {
+                        e.status = OfflineDownloadStatus::Cancelled;
+                        e.error = None;
+                    } else {
+                        e.status = OfflineDownloadStatus::Failed;
+                        e.error = Some(err);
+                    }
                     e.download_speed_bps = 0;
                 })
                 .await;
-                self.inner.download_workers.lock().await.remove(&download_id);
+                self.inner
+                    .download_workers
+                    .lock()
+                    .await
+                    .remove(&download_id);
                 return;
             }
         };
@@ -1002,7 +1204,8 @@ impl TorrentStreamingEngine {
         {
             let mut transfers = self.inner.transfers.write().await;
             if let Some(t) = transfers.get_mut(&info_hash) {
-                t.offline_downloads.insert(download_id.clone(), selected_idx);
+                t.offline_downloads
+                    .insert(download_id.clone(), selected_idx);
             }
         }
 
@@ -1258,7 +1461,6 @@ impl TorrentStreamingEngine {
     ) -> Result<Vec<OfflineDownloadEntry>, String> {
         if let Some(worker) = self.inner.download_workers.lock().await.remove(id) {
             worker.cancel.cancel();
-            worker.task.abort();
         }
         let (info_hash_opt, part_cleanup) = {
             let mut catalog = self.inner.download_catalog.lock().await;
@@ -1308,7 +1510,10 @@ impl TorrentStreamingEngine {
     /// Stop active playback session.
     /// If NO offline download is attached to that torrent, removes the torrent from `libtorrent`;
     /// if an offline download IS attached, keeps the shared transfer alive in the background!
-    pub async fn stop_active_session(&self, on_status: Option<StatusCallback>) -> StreamSessionStatus {
+    pub async fn stop_active_session(
+        &self,
+        on_status: Option<StatusCallback>,
+    ) -> StreamSessionStatus {
         self.inner.start_generation.fetch_add(1, Ordering::SeqCst);
         let _guard = self.inner.lifecycle_lock.lock().await;
         self.stop_playback_only_locked(None, on_status).await
@@ -1381,10 +1586,23 @@ impl TorrentStreamingEngine {
             w.task.abort();
         }
 
-        // Remove any remaining SeasonFetch-owned torrents from the engine
-        let hashes: Vec<String> = self.inner.transfers.write().await.drain().map(|(k, _)| k).collect();
-        for hash in hashes {
-            self.inner.libtorrent.remove_torrent(&hash).await;
+        // Remove only torrent sessions SeasonFetch recorded as owned; borrowed sessions belong to
+        // the external engine and must survive application shutdown.
+        let transfers: Vec<ManagedTransfer> = self
+            .inner
+            .transfers
+            .write()
+            .await
+            .drain()
+            .map(|(_, transfer)| transfer)
+            .collect();
+        for transfer in transfers {
+            if transfer.session_ownership == TorrentSessionOwnership::SeasonFetch {
+                self.inner
+                    .libtorrent
+                    .remove_torrent(&transfer.info_hash)
+                    .await;
+            }
         }
 
         if let Some(tx) = self.inner.http_shutdown.lock().await.take() {
@@ -1470,10 +1688,7 @@ fn default_downloads_dir(cache_root: &Path) -> PathBuf {
             return PathBuf::from(home).join("Downloads").join("SeasonFetch");
         }
     }
-    cache_root
-        .parent()
-        .unwrap_or(cache_root)
-        .join("downloads")
+    cache_root.parent().unwrap_or(cache_root).join("downloads")
 }
 
 fn generate_session_token(seq: u64) -> String {
@@ -1776,6 +1991,19 @@ mod tests {
         let st_stats = stats_json.clone();
         let st_file = stats_json.clone();
         let rm_log = Arc::clone(&removed_hashes);
+        let created_sessions = Arc::new(Mutex::new(Vec::<String>::new()));
+        let create_log = Arc::clone(&created_sessions);
+        let borrowed_hash = "abcdef0123456789abcdef0123456789abcdef01";
+        let mut borrowed_stats = stats_json.clone();
+        borrowed_stats["infoHash"] = serde_json::json!(borrowed_hash);
+        let sessions = Arc::new(RwLock::new(HashMap::from([(
+            borrowed_hash.to_string(),
+            borrowed_stats,
+        )])));
+        let create_sessions = Arc::clone(&sessions);
+        let stats_sessions = Arc::clone(&sessions);
+        let remove_sessions = Arc::clone(&sessions);
+        let hash_owned = hash.to_string();
 
         let mock_router = Router::new()
             .route(
@@ -1790,7 +2018,21 @@ mod tests {
                 "/create",
                 post(move || {
                     let v = st_create.clone();
-                    async move { axum::Json(v) }
+                    let sessions = Arc::clone(&create_sessions);
+                    let created = Arc::clone(&create_log);
+                    let hash = hash_owned.clone();
+                    async move {
+                        created.lock().await.push(hash.clone());
+                        sessions.write().await.insert(hash, v.clone());
+                        axum::Json(v)
+                    }
+                }),
+            )
+            .route(
+                "/stats.json",
+                get(move || {
+                    let sessions = Arc::clone(&stats_sessions);
+                    async move { axum::Json(sessions.read().await.clone()) }
                 }),
             )
             .route(
@@ -1812,8 +2054,10 @@ mod tests {
                 get(
                     move |axum::extract::Path(ih): axum::extract::Path<String>| {
                         let rm = Arc::clone(&rm_log);
+                        let sessions = Arc::clone(&remove_sessions);
                         async move {
-                            rm.lock().await.push(ih);
+                            rm.lock().await.push(ih.clone());
+                            sessions.write().await.remove(&ih);
                             axum::Json(serde_json::json!({}))
                         }
                     },
@@ -1830,9 +2074,8 @@ mod tests {
                             Arc::clone(&s_stream)
                         };
                         async move {
-                            if let Some(rh) = headers
-                                .get(header::RANGE)
-                                .and_then(|v| v.to_str().ok())
+                            if let Some(rh) =
+                                headers.get(header::RANGE).and_then(|v| v.to_str().ok())
                             {
                                 if let Some((s, e)) =
                                     seasonfetch_core::streaming::parse_http_byte_range(
@@ -1891,6 +2134,33 @@ mod tests {
         .unwrap();
         engine.set_upstream_base_url_for_testing(format!("http://127.0.0.1:{mock_port}"));
 
+        let borrowed_session = engine
+            .start_stream(
+                StartTorrentRequest {
+                    title: "BorrowedShow S01E01".to_string(),
+                    magnet_uri: None,
+                    info_hash: Some(borrowed_hash.to_string()),
+                    file_idx: Some(0),
+                    season: Some(1),
+                    episode: Some(1),
+                    trackers: vec![],
+                },
+                None,
+            )
+            .await
+            .expect("existing torrent session should be borrowed");
+        assert!(borrowed_session.stream_url.is_some());
+        assert!(created_sessions.lock().await.is_empty());
+        engine.stop_active_session(None).await;
+        assert!(
+            !removed_hashes
+                .lock()
+                .await
+                .iter()
+                .any(|h| h == borrowed_hash),
+            "stopping playback must never remove a borrowed torrent session"
+        );
+
         let session = engine
             .start_stream(
                 StartTorrentRequest {
@@ -1922,7 +2192,10 @@ mod tests {
         // GET full returns 200 + exact bytes
         let full_resp = client.get(&stream_url).send().await.unwrap();
         assert_eq!(full_resp.status(), reqwest::StatusCode::OK);
-        assert_eq!(full_resp.bytes().await.unwrap().as_ref(), payload.as_slice());
+        assert_eq!(
+            full_resp.bytes().await.unwrap().as_ref(),
+            payload.as_slice()
+        );
 
         // GET Range returns 206 + exact slice
         let range_resp = client
@@ -1936,7 +2209,10 @@ mod tests {
             range_resp.headers().get("content-range").unwrap(),
             &format!("bytes 100-199/{payload_len}")
         );
-        assert_eq!(range_resp.bytes().await.unwrap().as_ref(), &payload[100..=199]);
+        assert_eq!(
+            range_resp.bytes().await.unwrap().as_ref(),
+            &payload[100..=199]
+        );
 
         // Unsatisfiable Range returns 416
         let bad_range = client
@@ -1957,7 +2233,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(sub_resp.status(), reqwest::StatusCode::OK);
-        assert_eq!(sub_resp.bytes().await.unwrap().as_ref(), sub_payload.as_slice());
+        assert_eq!(
+            sub_resp.bytes().await.unwrap().as_ref(),
+            sub_payload.as_slice()
+        );
 
         // Start offline download while playing (reuses shared transfer) -> completes to disk
         let dl_entry = engine
@@ -2034,7 +2313,9 @@ mod tests {
         let (magnet, hash, trackers) = normalize_magnet_and_trackers(&req, false).unwrap();
         assert!(magnet.starts_with("magnet:?"));
         assert_eq!(hash, "0123456789abcdef0123456789abcdef01234567");
-        assert!(trackers.iter().any(|t| t == "udp://custom.tracker:80/announce"));
+        assert!(trackers
+            .iter()
+            .any(|t| t == "udp://custom.tracker:80/announce"));
         assert!(trackers.len() >= 8);
     }
 

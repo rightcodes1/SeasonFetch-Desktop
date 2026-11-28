@@ -8,10 +8,12 @@
 //!   so `seasonfetch-streaming` remains 100% Tauri-free and Win32-crate-free.
 
 use serde::Deserialize;
+use std::ffi::OsString;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex as StdMutex, RwLock as StdRwLock};
+use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 
 pub const DEFAULT_UPSTREAM_ORIGIN: &str = "http://127.0.0.1:11470";
@@ -100,10 +102,87 @@ impl EngineStatsDto {
     }
 }
 
+/// Exact command inputs needed to launch the upstream engine. The desktop host may provide a
+/// platform-specific launcher while this crate keeps its process-management boundary portable.
+#[derive(Debug, Clone)]
+pub struct EngineProcessSpec {
+    pub executable: PathBuf,
+    pub args: Vec<OsString>,
+    pub current_dir: Option<PathBuf>,
+    pub environment: Vec<(OsString, OsString)>,
+}
+
+/// Minimal owned-child operations required by the streaming engine lifecycle.
+pub trait EngineChild: Send {
+    fn id(&self) -> u32;
+    fn try_wait(&mut self) -> io::Result<Option<u32>>;
+    fn kill(&mut self) -> io::Result<()>;
+    fn wait(&mut self) -> io::Result<u32>;
+}
+
+/// Host-supplied process launcher. Windows desktop installs a Job Object-backed implementation.
+pub trait EngineProcessSpawner: Send + Sync {
+    fn spawn(&self, spec: &EngineProcessSpec) -> io::Result<Box<dyn EngineChild>>;
+}
+
+struct StdEngineChild(Child);
+
+impl EngineChild for StdEngineChild {
+    fn id(&self) -> u32 {
+        self.0.id()
+    }
+
+    fn try_wait(&mut self) -> io::Result<Option<u32>> {
+        self.0
+            .try_wait()
+            .map(|status| status.map(|status| status.code().unwrap_or_default() as u32))
+    }
+
+    fn kill(&mut self) -> io::Result<()> {
+        self.0.kill()
+    }
+
+    fn wait(&mut self) -> io::Result<u32> {
+        self.0
+            .wait()
+            .map(|status| status.code().unwrap_or_default() as u32)
+    }
+}
+
+struct StdEngineProcessSpawner;
+
+impl EngineProcessSpawner for StdEngineProcessSpawner {
+    fn spawn(&self, spec: &EngineProcessSpec) -> io::Result<Box<dyn EngineChild>> {
+        #[cfg(windows)]
+        {
+            let _ = spec;
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Windows engine startup requires the Job Object process launcher",
+            ));
+        }
+
+        #[cfg(not(windows))]
+        {
+            let mut cmd = Command::new(&spec.executable);
+            cmd.args(&spec.args).envs(spec.environment.iter().cloned());
+            if let Some(dir) = &spec.current_dir {
+                cmd.current_dir(dir);
+            }
+            cmd.stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            cmd.spawn()
+                .map(|child| Box::new(StdEngineChild(child)) as Box<dyn EngineChild>)
+        }
+    }
+}
+
 pub struct LibtorrentEngineClient {
     base_url: StdRwLock<String>,
     binary_path: StdRwLock<Option<PathBuf>>,
-    child: StdMutex<Option<Child>>,
+    child: StdMutex<Option<Box<dyn EngineChild>>>,
+    process_spawner: StdRwLock<Arc<dyn EngineProcessSpawner>>,
     externally_owned: AtomicBool,
     settings_applied: AtomicBool,
     start_lock: tokio::sync::Mutex<()>,
@@ -133,6 +212,7 @@ impl LibtorrentEngineClient {
             base_url: StdRwLock::new(DEFAULT_UPSTREAM_ORIGIN.to_string()),
             binary_path: StdRwLock::new(None),
             child: StdMutex::new(None),
+            process_spawner: StdRwLock::new(Arc::new(StdEngineProcessSpawner)),
             externally_owned: AtomicBool::new(false),
             settings_applied: AtomicBool::new(false),
             start_lock: tokio::sync::Mutex::new(()),
@@ -146,6 +226,16 @@ impl LibtorrentEngineClient {
         if let Ok(mut guard) = self.binary_path.write() {
             *guard = Some(cleaned);
         }
+    }
+
+    pub fn set_process_spawner(&self, spawner: Arc<dyn EngineProcessSpawner>) {
+        if let Ok(mut guard) = self.process_spawner.write() {
+            *guard = spawner;
+        }
+    }
+
+    pub fn is_externally_owned(&self) -> bool {
+        self.externally_owned.load(Ordering::Acquire)
     }
 
     pub fn set_base_url(&self, origin: String) {
@@ -251,28 +341,25 @@ impl LibtorrentEngineClient {
             exe_path.display()
         ));
 
-        let mut cmd = Command::new(&exe_path);
-        cmd.arg("--no-tray")
-            .env("STREMIO_CACHE_ROOT", cache_root)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-
-        if let Some(parent) = exe_path.parent() {
-            cmd.current_dir(parent);
-        }
-
+        let mut environment = vec![(
+            OsString::from("STREMIO_CACHE_ROOT"),
+            cache_root.as_os_str().to_os_string(),
+        )];
         if let Some(augmented_path) = build_augmented_path_with_ffmpeg(&exe_path) {
-            cmd.env("PATH", augmented_path);
+            environment.push((OsString::from("PATH"), augmented_path));
         }
-
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(CREATE_NO_WINDOW);
-        }
-
-        let child = cmd.spawn().map_err(|e| {
+        let spec = EngineProcessSpec {
+            executable: exe_path.clone(),
+            args: vec![OsString::from("--no-tray")],
+            current_dir: exe_path.parent().map(Path::to_path_buf),
+            environment,
+        };
+        let spawner = self
+            .process_spawner
+            .read()
+            .map_err(|_| "Streaming engine process launcher lock was poisoned.".to_string())?
+            .clone();
+        let child = spawner.spawn(&spec).map_err(|e| {
             format!(
                 "Failed to start libtorrent streaming engine ({}): {e}",
                 exe_path.display()
@@ -432,25 +519,50 @@ impl LibtorrentEngineClient {
         Ok(dto)
     }
 
-    pub async fn get_engine_stats(&self, info_hash: &str) -> Result<EngineStatsDto, String> {
-        let url = format!(
-            "{}/{}/stats.json",
-            self.base_url(),
-            info_hash.to_ascii_lowercase()
-        );
+    /// Read all existing sessions through the side-effect-free `/stats.json` endpoint.
+    /// The upstream `/{infoHash}/stats.json` route auto-creates a missing torrent, so it must
+    /// never be used as an existence check.
+    pub async fn lookup_engine_stats(
+        &self,
+        info_hash: &str,
+    ) -> Result<Option<EngineStatsDto>, String> {
+        let url = format!("{}/stats.json", self.base_url());
         let resp = self
             .api_client
             .get(&url)
-            .timeout(Duration::from_secs(4))
+            .timeout(Duration::from_secs(5))
             .send()
             .await
-            .map_err(|e| format!("Stats request failed: {e}"))?;
+            .map_err(|e| format!("Global stats request failed: {e}"))?;
         if !resp.status().is_success() {
-            return Err(format!("Stats HTTP {}", resp.status()));
+            return Err(format!("Global stats HTTP {}", resp.status()));
         }
-        resp.json::<EngineStatsDto>()
+        let value = resp
+            .json::<serde_json::Value>()
             .await
-            .map_err(|e| format!("Stats parse error: {e}"))
+            .map_err(|e| format!("Global stats parse error: {e}"))?;
+        let sessions = value
+            .as_object()
+            .ok_or_else(|| "Global stats response was not a JSON object.".to_string())?;
+        let Some(stats) = sessions
+            .iter()
+            .find(|(session_hash, _)| session_hash.eq_ignore_ascii_case(info_hash))
+            .map(|(_, stats)| stats)
+        else {
+            return Ok(None);
+        };
+        serde_json::from_value::<EngineStatsDto>(stats.clone())
+            .map(Some)
+            .map_err(|e| format!("Torrent stats parse error: {e}"))
+    }
+
+    pub async fn get_engine_stats(&self, info_hash: &str) -> Result<EngineStatsDto, String> {
+        self.lookup_engine_stats(info_hash).await?.ok_or_else(|| {
+            format!(
+                "Torrent session {} is not present.",
+                info_hash.to_ascii_lowercase()
+            )
+        })
     }
 
     pub async fn get_file_stats(
@@ -458,25 +570,14 @@ impl LibtorrentEngineClient {
         info_hash: &str,
         file_idx: usize,
     ) -> Result<EngineStatsDto, String> {
-        let url = format!(
-            "{}/{}/{}/stats.json",
-            self.base_url(),
-            info_hash.to_ascii_lowercase(),
-            file_idx
-        );
-        let resp = self
-            .api_client
-            .get(&url)
-            .timeout(Duration::from_secs(4))
-            .send()
-            .await
-            .map_err(|e| format!("File stats request failed: {e}"))?;
-        if !resp.status().is_success() {
-            return Err(format!("File stats HTTP {}", resp.status()));
-        }
-        resp.json::<EngineStatsDto>()
-            .await
-            .map_err(|e| format!("File stats parse error: {e}"))
+        let mut stats = self.get_engine_stats(info_hash).await?;
+        let file = stats
+            .files
+            .get(file_idx)
+            .ok_or_else(|| format!("Torrent session has no file at index {file_idx}."))?;
+        stats.stream_len = file.length;
+        stats.stream_progress = file.progress;
+        Ok(stats)
     }
 
     pub async fn remove_torrent(&self, info_hash: &str) {
@@ -549,8 +650,16 @@ impl Drop for LibtorrentEngineClient {
 }
 
 fn build_augmented_path_with_ffmpeg(engine_exe: &Path) -> Option<std::ffi::OsString> {
-    let ffmpeg_name = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
-    let ffprobe_name = if cfg!(windows) { "ffprobe.exe" } else { "ffprobe" };
+    let ffmpeg_name = if cfg!(windows) {
+        "ffmpeg.exe"
+    } else {
+        "ffmpeg"
+    };
+    let ffprobe_name = if cfg!(windows) {
+        "ffprobe.exe"
+    } else {
+        "ffprobe"
+    };
 
     let mut search_dirs: Vec<PathBuf> = Vec::new();
     if let Some(parent) = engine_exe.parent() {
@@ -562,7 +671,12 @@ fn build_augmented_path_with_ffmpeg(engine_exe: &Path) -> Option<std::ffi::OsStr
     {
         if let Ok(local_app) = std::env::var("LOCALAPPDATA") {
             let base = PathBuf::from(&local_app);
-            search_dirs.push(base.join("stremio-server").join("tools").join("ffmpeg").join("bin"));
+            search_dirs.push(
+                base.join("stremio-server")
+                    .join("tools")
+                    .join("ffmpeg")
+                    .join("bin"),
+            );
             search_dirs.push(base.join("Programs").join("LNV").join("Stremio-4"));
             search_dirs.push(base.join("Microsoft").join("WinGet").join("Links"));
         }
@@ -579,4 +693,94 @@ fn build_augmented_path_with_ffmpeg(engine_exe: &Path) -> Option<std::ffi::OsStr
         paths.extend(std::env::split_paths(&existing));
     }
     std::env::join_paths(paths).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::StatusCode;
+    use axum::routing::get;
+    use axum::{Json, Router};
+
+    async fn serve(app: Router) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), task)
+    }
+
+    #[tokio::test]
+    async fn global_stats_lookup_returns_existing_and_missing_without_per_hash_requests() {
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        let app = Router::new().route(
+            "/stats.json",
+            get(move || async move {
+                Json(serde_json::json!({
+                    hash: {
+                        "infoHash": hash,
+                        "name": "existing",
+                        "files": []
+                    }
+                }))
+            }),
+        );
+        let (origin, task) = serve(app).await;
+        let client = LibtorrentEngineClient::new().unwrap();
+        client.set_base_url(origin);
+
+        let found = client.lookup_engine_stats(hash).await.unwrap().unwrap();
+        assert_eq!(found.info_hash, hash);
+        assert_eq!(found.name, "existing");
+        assert!(client
+            .lookup_engine_stats("abcdef0123456789abcdef0123456789abcdef01")
+            .await
+            .unwrap()
+            .is_none());
+
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn global_stats_lookup_keeps_http_and_json_failures_distinct_from_absence() {
+        let app = Router::new().route(
+            "/stats.json",
+            get(|| async { (StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable") }),
+        );
+        let (origin, task) = serve(app).await;
+        let client = LibtorrentEngineClient::new().unwrap();
+        client.set_base_url(origin);
+        let error = client
+            .lookup_engine_stats("0123456789abcdef0123456789abcdef01234567")
+            .await
+            .unwrap_err();
+        assert!(error.contains("503"));
+        task.abort();
+
+        let app = Router::new().route("/stats.json", get(|| async { "not-json" }));
+        let (origin, task) = serve(app).await;
+        client.set_base_url(origin);
+        let error = client
+            .lookup_engine_stats("0123456789abcdef0123456789abcdef01234567")
+            .await
+            .unwrap_err();
+        assert!(error.contains("parse error"));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn global_stats_lookup_reports_connection_failure_as_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let client = LibtorrentEngineClient::new().unwrap();
+        client.set_base_url(format!("http://{addr}"));
+        assert!(client
+            .lookup_engine_stats("0123456789abcdef0123456789abcdef01234567")
+            .await
+            .unwrap_err()
+            .contains("request failed"));
+    }
 }

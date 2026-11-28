@@ -8,7 +8,8 @@ mod settings;
 mod subtitles;
 mod torrentio_client;
 mod updater;
-
+#[cfg(windows)]
+mod stream_engine_process;
 use api_bridge::{ApiBridge, ApiBridgeRequest, ApiBridgeResponse};
 use auth_vault::AuthVault;
 use chrono::Utc;
@@ -912,6 +913,10 @@ pub fn run() {
                     if let Some(exe_path) = stream_engine_exe {
                         engine.set_engine_binary_path(exe_path);
                     }
+                    #[cfg(windows)]
+                    engine.set_engine_process_spawner(Arc::new(
+                        stream_engine_process::WindowsEngineProcessSpawner,
+                    ));
                     let stream_logger = logger.clone();
                     let _ = tauri::async_runtime::block_on(engine.set_log_callback(Arc::new(
                         move |msg: &str| {
